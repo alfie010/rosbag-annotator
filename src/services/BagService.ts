@@ -8,7 +8,8 @@ interface Time {
 }
 
 export interface JointStateMsg {
-    name?: string[];
+    header?: any;
+    name: string[];
     position: number[];
     velocity: number[];
     effort: number[];
@@ -18,13 +19,7 @@ export type ParsedFrame = {
     timestamp: number;
     index: number;
     images: Record<string, string>;
-    jointState: JointStateMsg | null;
-};
-
-export type JointDataPoint = {
-    position: number[];
-    velocity: number[];
-    effort: number[];
+    jointStateMap: Record<string, JointStateMsg>;
 };
 
 type FrameImageMap = Map<string, Time>;
@@ -45,7 +40,7 @@ interface LightMessage {
     timestamp: number; // ms
     originalTime: Time;
     topic: string;
-    data?: any; // Joint 数据需要存下来，Image 只需要时间戳
+    data?: any;
 }
 
 export class BagService {
@@ -55,7 +50,7 @@ export class BagService {
     // --- Public State ---
     public timestamps: number[] = []; 
     public topicMetadata: Record<string, { msgType: string; title: string }> = {};
-    public historicalJointData: Map<number, JointDataPoint> = new Map();
+    public historicalJointData: Map<number, Record<string, JointStateMsg>> = new Map();
 
     // --- Private State ---
     private imageTopics: string[] = [];
@@ -85,21 +80,22 @@ export class BagService {
                     this.topicMetadata[conn.topic] = { msgType: conn.type, title: conn.topic };
                     this.jointTopics.push(conn.topic);
                 }
+                console.log(conn);
             }
             
-            // 对 topic 排序以保证一致性 (参考代码逻辑)
+            // Sort topics for consistent processing
             this.imageTopics.sort();
             this.jointTopics.sort();
 
             const targetTopics = [...this.imageTopics, ...this.jointTopics];
             if (targetTopics.length === 0) throw new Error("No compatible topics found.");
 
-            // 2. Extract All Messages (预读所有 Joint 数据 + Image 的时间戳)
+            // 2. Extract All Messages
             onProgress?.('Scanning Messages...');
             
             const allMessages: LightMessage[] = [];
             
-            // 使用迭代器读取所有目标消息
+            // Read messages for target topics
             for await (const msg of this.bag.messageIterator({ topics: targetTopics })) {
                 const ts = this.timeToMs(msg.timestamp);
                 const lightMsg: LightMessage = {
@@ -108,48 +104,45 @@ export class BagService {
                     topic: msg.topic
                 };
 
-                // 如果是 Joint，我们需要把数据存下来用于 ZOH
+                // For JointState, we need the full data
                 if (this.jointTopics.includes(msg.topic)) {
                     lightMsg.data = msg.message;
                 }
-                // 如果是 Image，我们只需要知道它在这一刻存在即可，不需要存 data
-
+                // Otherwise, for Image, we only need the timestamp
                 allMessages.push(lightMsg);
             }
 
             if (allMessages.length === 0) throw new Error("No messages found.");
 
-            // 按时间排序
+            // Sort messages by timestamp
             allMessages.sort((a, b) => a.timestamp - b.timestamp);
 
-            // 3. Bootstrapping (关键步骤：寻找“完全就绪”的时间点)
+            // 3. Bootstrapping
             onProgress?.('Aligning Timeline...');
             
             const seenTopics = new Set<string>();
             let startMsgIndex = 0;
             let firstFullStateTime: number | null = null;
             
-            // 初始状态累加器
             const currentJoints: Record<string, any> = {}; 
             const currentImageTimes = new Map<string, Time>();
 
-            // 遍历消息直到集齐所有 Topic
             for (let i = 0; i < allMessages.length; i++) {
                 const msg = allMessages[i];
                 seenTopics.add(msg.topic);
 
-                // 更新初始状态
+                // Update current state
                 if (this.jointTopics.includes(msg.topic)) {
                     currentJoints[msg.topic] = msg.data;
                 } else {
                     currentImageTimes.set(msg.topic, msg.originalTime);
                 }
 
-                // 检查是否所有目标 Topic 都已出现
+                // Check if all topics have been seen
                 const allReady = targetTopics.every(t => seenTopics.has(t));
                 if (allReady) {
                     firstFullStateTime = msg.timestamp;
-                    startMsgIndex = i; // 从这里开始后面的回放
+                    startMsgIndex = i; // Start from the next message
                     break;
                 }
             }
@@ -166,17 +159,16 @@ export class BagService {
             const endTime = allMessages[allMessages.length - 1].timestamp;
             let msgCursor = startMsgIndex;
             
-            // 从 firstFullStateTime 开始生成时间轴
             for (let t = firstFullStateTime; t <= endTime; t += 33.33) {
                 const frameTime = Math.round(t);
                 const frameIdx = this.timestamps.length;
                 this.timestamps.push(frameTime);
 
-                // 追赶消息指针：处理所有 <= 当前帧时间的消息
+                // Process messages up to current frame time
                 while (msgCursor < allMessages.length && allMessages[msgCursor].timestamp <= t) {
                     const msg = allMessages[msgCursor];
                     
-                    // 更新“当前状态”
+                    // Update current state
                     if (this.jointTopics.includes(msg.topic)) {
                         currentJoints[msg.topic] = msg.data;
                     } else {
@@ -185,13 +177,8 @@ export class BagService {
                     
                     msgCursor++;
                 }
-
-                // Snapshot: 保存当前帧的“状态快照”
-                
-                // A. 保存 Joint 数据 (合并左右臂)
+                // Snapshot data for this frame
                 this.snapshotJointData(frameIdx, currentJoints);
-
-                // B. 保存 Image 索引 (深拷贝 Map)
                 this.frameImageIndex.set(frameIdx, new Map(currentImageTimes));
             }
 
@@ -205,16 +192,27 @@ export class BagService {
     }
 
     private snapshotJointData(frameIdx: number, currentJoints: Record<string, any>) {
-        // 这里根据你的实际 Topic 名称做合并
-        // 注意：这里要做防御性编程，因为 Bootstrapping 保证了都有值，但最好还是给个空数组默认值
-        const leftData = currentJoints["/puppet/joint_left"] || { position: [], velocity: [], effort: [] };
-        const rightData = currentJoints["/puppet/joint_right"] || { position: [], velocity: [], effort: [] };
+        const frameJoints: Record<string, JointStateMsg> = {};
 
-        this.historicalJointData.set(frameIdx, {
-            position: [...(leftData.position || []), ...(rightData.position || [])],
-            velocity: [...(leftData.velocity || []), ...(rightData.velocity || [])],
-            effort: [...(leftData.effort || []), ...(rightData.effort || [])]
+        // Iterate over all discovered joint topics
+        this.jointTopics.forEach(topic => {
+            const rawMsg = currentJoints[topic];
+            
+            if (rawMsg) {
+                if (!rawMsg.name || rawMsg.name.length === 0) {
+                    const len = rawMsg.position ? rawMsg.position.length : 0;
+                    const generatedNames = Array.from({ length: len }, (_, k) => `joint${k + 1}`);
+                    frameJoints[topic] = {
+                        ...rawMsg,
+                        name: generatedNames
+                    };
+                } else {
+                    frameJoints[topic] = rawMsg;
+                }
+            }
         });
+
+        this.historicalJointData.set(frameIdx, frameJoints);
     }
 
     private reset() {
@@ -232,7 +230,6 @@ export class BagService {
         return t.sec * 1000 + Math.round(t.nsec / 1e6);
     }
 
-    // --- getFrameAt 保持大部分逻辑不变，因为索引已经建立好了 ---
     async getFrameAt(index: number): Promise<ParsedFrame | null> {
         if (!this.bag || index < 0 || index >= this.timestamps.length) return null;
 
@@ -243,42 +240,23 @@ export class BagService {
             timestamp: targetTs,
             index,
             images: {},
-            jointState: null
+            jointStateMap: this.historicalJointData.get(index) || {}
         };
 
-        // 1. 填充关节 (直接从 Map 取，已经是 O(1) 了)
-        const jointData = this.historicalJointData.get(index);
-        if (jointData) {
-            frameData.jointState = {
-                name: [], // 如果需要名字，可以在 snapshot 时也合并名字
-                position: jointData.position,
-                velocity: jointData.velocity,
-                effort: jointData.effort
-            };
-        }
-
-        // 2. 填充图片 (IO)
         const imageSnapshot = this.frameImageIndex.get(index);
         
         if (imageSnapshot && imageSnapshot.size > 0) {
             const promises = Array.from(imageSnapshot.entries()).map(async ([topic, exactTime]) => {
-                // 读取逻辑... (保持你原来的代码逻辑，读取单条)
                 try {
                      const iter = this.bag!.messageIterator({
                         topics: [topic],
                         start: exactTime,
-                        // end: exactTime // Foxglove 有时不支持精确 end，依赖 break
                     });
 
                     for await (const msg of iter) {
-                        // 校验时间戳是否匹配（防止读到后面的图）
-                        // 在 ZOH 逻辑下，我们存的是 <= frameTime 的最新图
-                        // 所以读出来的这张图的 timestamp 应该等于 exactTime
-                        // 稍微容错一下
                         const msgTime = msg.timestamp;
                         if (msgTime.sec === exactTime.sec && msgTime.nsec === exactTime.nsec) {
                              const msgAny = msg.message as any;
-                             // ... 解码逻辑 (保持不变)
                              const type = this.topicMetadata[topic].msgType;
                              if (type.includes('CompressedImage')) {
                                 const format = msgAny.format?.includes('png') ? 'png' : 'jpeg';
@@ -289,7 +267,7 @@ export class BagService {
                                 if (url) frameData.images[topic] = url;
                              }
                         }
-                        break; // 读到一条即走
+                        break; // Only need the first matching message
                     }
                 } catch (e) { console.warn(e); }
             });

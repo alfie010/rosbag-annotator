@@ -14,8 +14,10 @@ import {
 import annotationPlugin from 'chartjs-plugin-annotation';
 
 // --- Imports (Adjust paths as needed) ---
-import { BagService, type ParsedFrame, type JointDataPoint } from './services/BagService';
+import { BagService, type ParsedFrame, type JointStateMsg } from './services/BagService';
 import UrdfViewer from './components/urdf/UrdfViewer';
+import { UrdfSettingsDialog, PIPER_CONFIG } from './components/dialogs/UrdfSettingsDialog';
+import type { UrdfConfig } from './components/urdf/UrdfViewer';
 
 // --- Register ChartJS ---
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, annotationPlugin);
@@ -52,11 +54,6 @@ const PROMPT_OPTIONS = {
 
 const MIN_CONTACT_FRAMES = 5;
 
-const JOINT_NAMES_DEFAULT = [
-    'Left J1', 'Left J2', 'Left J3', 'Left J4', 'Left J5', 'Left J6', 'Left Gripper',
-    'Right J1', 'Right J2', 'Right J3', 'Right J4', 'Right J5', 'Right J6', 'Right Gripper'
-];
-
 const PLACEHOLDER_IMG = 'data:image/svg+xml;charset=UTF-8,%3csvg xmlns="http://www.w3.org/2000/svg" width="640" height="480"%3e%3crect width="100%25" height="100%25" fill="%230f172a"/%3e%3ctext x="50%25" y="50%25" fill="%23334155" font-family="monospace" font-size="20px" dominant-baseline="middle" text-anchor="middle"%3eNO SIGNAL%3c/text%3e%3c/svg%3e';
 
 // --- Helpers ---
@@ -76,6 +73,10 @@ const AnnotationPage: React.FC = () => {
     // --- Services ---
     const [bagService] = useState(() => new BagService());
 
+    // --- State: Settings ---
+    const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+    const [urdfConfig, setUrdfConfig] = useState<UrdfConfig>(PIPER_CONFIG);
+
     // --- State: File & Data ---
     const [isFileLoaded, setIsFileLoaded] = useState(false);
     const [fileName, setFileName] = useState('');
@@ -93,16 +94,16 @@ const AnnotationPage: React.FC = () => {
     // --- State: Visuals ---
     const [orderedImageTopics, setOrderedImageTopics] = useState<string[]>([]);
     const [draggedTopic, setDraggedTopic] = useState<string | null>(null);
-    const [historicalJointData, setHistoricalJointData] = useState<Map<number, JointDataPoint>>(new Map());
-    
+    const [historicalJointData, setHistoricalJointData] = useState<Map<number, Record<string, JointStateMsg>>>(new Map());
+    const [availableJointNames, setAvailableJointNames] = useState<string[]>([]);
+
     // Joint Graph Settings
-    const [jointSelectionMode, setJointSelectionMode] = useState<'all' | 'left' | 'right' | 'grippers' | 'single'>('all');
-    const [singleJointIndex, setSingleJointIndex] = useState<number>(0);
     const [selectedJointDataType, setSelectedJointDataType] = useState<'position' | 'velocity' | 'effort'>('position');
+    const [selectedJointsToChart, setSelectedJointsToChart] = useState<string[]>([]);
 
     // --- State: Annotation ---
     const [subtasks, setSubtasks] = useState<SubtaskAnnotation[]>([]);
-    const [contacts, setContacts] = useState<ContactAnnotation[]>([]); 
+    const [contacts, setContacts] = useState<ContactAnnotation[]>([]);
     const [selectedSubtaskId, setSelectedSubtaskId] = useState<string | null>(null);
     const [selectedContactId, setSelectedContactId] = useState<string | null>(null);
     const [pendingContactStart, setPendingContactStart] = useState<number | null>(null);
@@ -134,7 +135,31 @@ const AnnotationPage: React.FC = () => {
             await bagService.loadFile(file, (msg) => setLoadingMessage(msg));
             setTimestamps(bagService.timestamps);
             setTopicMetadata(bagService.topicMetadata);
-            setHistoricalJointData(bagService.historicalJointData);
+
+            // 1. Get the raw data map
+            const history = bagService.historicalJointData;
+            setHistoricalJointData(history);
+
+            // 2. Discover Joints Dynamically
+            // Look at the first frame that has data
+            const firstData = history.get(0);
+            const foundJoints: string[] = [];
+
+            if (firstData) {
+                // Iterate over all topics in this frame (e.g., /joint_states)
+                Object.entries(firstData).forEach(([topic, msg]) => {
+                    if (msg.name && Array.isArray(msg.name) && msg.name.length > 0) {
+                        msg.name.forEach(name => {
+                            foundJoints.push(`${topic}/${name}`);
+                        });
+                    }
+                });
+            }
+
+            setAvailableJointNames(foundJoints);
+
+            // Default: Select first 6 joints for the chart to avoid overcrowding
+            setSelectedJointsToChart(foundJoints.slice(0, 6));
 
             const allImageTopics = Object.keys(bagService.topicMetadata)
                 .filter(k => bagService.topicMetadata[k].msgType.includes('Image'))
@@ -142,7 +167,7 @@ const AnnotationPage: React.FC = () => {
             // Try to recover layout from LocalStorage
             const topicKeysString = Object.keys(bagService.topicMetadata).sort().join('-');
             const savedLayoutJson = localStorage.getItem(`rosbag-layout-${topicKeysString}`);
-            
+
             if (savedLayoutJson) {
                 try {
                     const savedLayout = JSON.parse(savedLayoutJson);
@@ -182,8 +207,8 @@ const AnnotationPage: React.FC = () => {
         }
     };
 
-    const handleGlobalDragOver = (e: React.DragEvent) => { 
-        e.preventDefault(); 
+    const handleGlobalDragOver = (e: React.DragEvent) => {
+        e.preventDefault();
         // Only trigger if dragging files, NOT if dragging internal elements (like images)
         if (e.dataTransfer.types.includes('Files')) {
             setIsDragOver(true);
@@ -201,7 +226,7 @@ const AnnotationPage: React.FC = () => {
             filename: fileName,
             metadata: {
                 totalFrames: timestamps.length,
-                duration: timestamps.length > 0 ? timestamps[timestamps.length-1] - timestamps[0] : 0
+                duration: timestamps.length > 0 ? timestamps[timestamps.length - 1] - timestamps[0] : 0
             },
             subtasks,
             contacts
@@ -288,7 +313,7 @@ const AnnotationPage: React.FC = () => {
     }, [orderedImageTopics, isFileLoaded, topicMetadata]);
 
     // 4. Annotation Logic (Subtasks & Contacts)
-    
+
     // --- Subtask ---
     const handleSubtaskChange = (val: string) => {
         setSubtasks(prev => prev.map(s => s.id === selectedSubtaskId ? { ...s, prompt: val } : s));
@@ -321,7 +346,7 @@ const AnnotationPage: React.FC = () => {
             newList[index] = { ...current, end: next.end };
             newList.splice(index + 1, 1); // Remove next
         }
-        
+
         setSubtasks(newList);
     };
 
@@ -346,7 +371,7 @@ const AnnotationPage: React.FC = () => {
         let start = Math.min(pendingContactStart, endIndex);
         let end = Math.max(pendingContactStart, endIndex);
         if (end - start < MIN_CONTACT_FRAMES) end = Math.min(timestamps.length - 1, start + MIN_CONTACT_FRAMES);
-        
+
         setContacts([...contacts, { id: generateUniqueId(), username: 'local', start, end }]);
         setPendingContactStart(null);
     };
@@ -378,7 +403,7 @@ const AnnotationPage: React.FC = () => {
             if ((e.key === 'Delete' || e.key === 'Backspace') && selectedContactId) {
                 const activeElement = document.activeElement;
                 const isInput = activeElement?.tagName === 'INPUT' || activeElement?.tagName === 'TEXTAREA';
-                
+
                 if (!isInput) {
                     handleDeleteContact();
                 }
@@ -445,7 +470,7 @@ const AnnotationPage: React.FC = () => {
         const rect = timelineInnerRef.current.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const index = Math.min(Math.max(0, Math.round((x / rect.width) * (timestamps.length - 1))), timestamps.length - 1);
-        
+
         setCurrentFrameIndex(index);
         setIsPlaying(false);
 
@@ -469,39 +494,68 @@ const AnnotationPage: React.FC = () => {
     };
 
     // 6. Chart Logic
+
+    // --- Helper: Group joints by topic for batch selection ---
+    const uniqueTopics = useMemo(() => {
+        const topics = new Set(availableJointNames.map(n => n.substring(0, n.lastIndexOf('/'))));
+        return Array.from(topics).sort();
+    }, [availableJointNames]);
+
+    const toggleTopic = (topic: string) => {
+        const jointsInTopic = availableJointNames.filter(n => n.startsWith(topic + '/'));
+        // Check if all joints in this topic are currently selected
+        const isAllSelected = jointsInTopic.every(j => selectedJointsToChart.includes(j));
+
+        if (isAllSelected) {
+            // Deselect all
+            setSelectedJointsToChart(prev => prev.filter(j => !jointsInTopic.includes(j)));
+        } else {
+            // Select all (Union)
+            setSelectedJointsToChart(prev => Array.from(new Set([...prev, ...jointsInTopic])));
+        }
+    };
+
+    // --- Chart Data & Options ---
     const plotData = useMemo(() => {
-        if (historicalJointData.size === 0) return { labels: [], datasets: [] };
-        
-        // Removed downsampling (filter) to ensure Red Line (index based) matches X-axis 1:1
-        // If performance is an issue, we would need to map currentFrameIndex to the downsampled index, 
-        // but removing it is the safest way to fix the "Red line position wrong" issue.
-        const indices = Array.from(historicalJointData.keys()).sort((a,b)=>a-b);
+        if (historicalJointData.size === 0 || availableJointNames.length === 0) {
+            return { labels: [], datasets: [] };
+        }
+
+        const indices = Array.from(historicalJointData.keys()).sort((a, b) => a - b);
         const labels = indices.map(i => formatTime(timestamps[i] - timestamps[0]));
-        
-        let targetIndices: number[] = [];
-        if (jointSelectionMode === 'all') targetIndices = Array.from({length: 14}, (_, i) => i);
-        else if (jointSelectionMode === 'left') targetIndices = [0,1,2,3,4,5,6];
-        else if (jointSelectionMode === 'right') targetIndices = [7,8,9,10,11,12,13];
-        else if (jointSelectionMode === 'grippers') targetIndices = [6, 13];
-        else if (jointSelectionMode === 'single') targetIndices = [singleJointIndex];
 
-        const colors = ['#22d3ee', '#38bdf8', '#60a5fa', '#818cf8', '#a78bfa', '#c084fc', '#e879f9', '#f472b6', '#fb7185', '#f87171', '#fb923c', '#fbbf24', '#facc15', '#a3e635'];
+        const colors = [
+            '#22d3ee', '#38bdf8', '#60a5fa', '#818cf8', '#a78bfa', '#c084fc',
+            '#e879f9', '#f472b6', '#fb7185', '#f87171', '#fb923c', '#fbbf24',
+            '#facc15', '#a3e635'
+        ];
 
-        const datasets = targetIndices.map(jointIdx => ({
-            label: JOINT_NAMES_DEFAULT[jointIdx] || `J${jointIdx}`,
+        const datasets = selectedJointsToChart.map((uniqueId, i) => ({
+            label: uniqueId,
             data: indices.map(idx => {
-                const f = historicalJointData.get(idx);
-                return f ? (f[selectedJointDataType] as any)[jointIdx] : null;
+                const frameData = historicalJointData.get(idx);
+                if (!frameData) return null;
+
+                for (const topic of Object.keys(frameData)) {
+                    const msg = frameData[topic];
+
+                    const pos = msg.name.findIndex(rawName => `${topic}/${rawName}` === uniqueId);
+
+                    if (pos !== -1 && msg[selectedJointDataType]) {
+                        return msg[selectedJointDataType][pos];
+                    }
+                }
+                return null;
             }),
-            borderColor: colors[jointIdx % colors.length],
-            backgroundColor: colors[jointIdx % colors.length],
+            borderColor: colors[i % colors.length],
+            backgroundColor: colors[i % colors.length],
             pointRadius: 0,
             borderWidth: 1.2,
             tension: 0.1
         }));
 
         return { labels, datasets };
-    }, [historicalJointData, jointSelectionMode, singleJointIndex, selectedJointDataType, timestamps]);
+    }, [historicalJointData, selectedJointsToChart, selectedJointDataType, timestamps]);
 
     const plotOptions = useMemo<ChartOptions<'line'>>(() => {
         return {
@@ -526,14 +580,14 @@ const AnnotationPage: React.FC = () => {
                 }
             },
             scales: {
-                x: { 
-                    ticks: { color: '#64748b', maxTicksLimit: 8, font: { family: 'monospace', size: 10 } }, 
-                    grid: { color: '#1e293b' } 
+                x: {
+                    ticks: { color: '#64748b', maxTicksLimit: 8, font: { family: 'monospace', size: 10 } },
+                    grid: { color: '#1e293b' }
                 },
-                y: { 
-                    ticks: { color: '#64748b', font: { family: 'monospace', size: 10 } }, 
-                    grid: { color: '#1e293b' }, 
-                    title: { display: true, text: selectedJointDataType.toUpperCase(), color: '#475569', font: { size: 10, weight: 'bold' } } 
+                y: {
+                    ticks: { color: '#64748b', font: { family: 'monospace', size: 10 } },
+                    grid: { color: '#1e293b' },
+                    title: { display: true, text: selectedJointDataType.toUpperCase(), color: '#475569', font: { size: 10, weight: 'bold' } }
                 }
             }
         };
@@ -542,7 +596,7 @@ const AnnotationPage: React.FC = () => {
 
     // --- Render ---
     return (
-        <div 
+        <div
             className="w-screen h-screen bg-[#050505] text-slate-300 font-mono overflow-hidden flex flex-col relative selection:bg-cyan-500/30"
             onDragOver={handleGlobalDragOver} onDragLeave={handleGlobalDragLeave} onDrop={handleGlobalDrop}
         >
@@ -562,6 +616,10 @@ const AnnotationPage: React.FC = () => {
                     {fileName && <span className="ml-4 text-xs font-medium text-gray-400 bg-gray-900 px-3 py-1 rounded-full border border-gray-800">{fileName}</span>}
                 </div>
                 <div className="flex gap-3">
+                    <button onClick={() => setIsSettingsOpen(true)} className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs font-bold uppercase tracking-wider rounded border border-gray-700">
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                        Config
+                    </button>
                     {isFileLoaded && (
                         <button onClick={handleExportJSON} className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-cyan-400 text-xs font-bold uppercase tracking-wider rounded border border-gray-700 transition-all hover:border-cyan-500/50 hover:shadow-[0_0_15px_rgba(6,182,212,0.1)]">
                             <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
@@ -590,7 +648,7 @@ const AnnotationPage: React.FC = () => {
                             <div className="flex-grow bg-[#020202] p-2 grid grid-cols-3 gap-2 overflow-y-auto content-start custom-scrollbar">
                                 {orderedImageTopics.map((topic) => (
                                     <div key={topic} draggable onDragStart={(e) => handleImageDragStart(e, topic)} onDrop={(e) => handleImageDrop(e, topic)} onDragOver={(e) => e.preventDefault()}
-                                        className={`relative aspect-[4/3] rounded-lg border border-gray-800 bg-gray-900/50 overflow-hidden group transition-all hover:border-gray-600 ${draggedTopic===topic ? 'opacity-40 ring-2 ring-cyan-500 border-transparent' : ''}`}
+                                        className={`relative aspect-[4/3] rounded-lg border border-gray-800 bg-gray-900/50 overflow-hidden group transition-all hover:border-gray-600 ${draggedTopic === topic ? 'opacity-40 ring-2 ring-cyan-500 border-transparent' : ''}`}
                                     >
                                         <div className="absolute top-2 left-2 px-2 py-1 bg-black/80 backdrop-blur text-[10px] font-bold text-cyan-400 border border-white/5 rounded shadow-lg z-10 pointer-events-none select-none tracking-tight">
                                             {topicMetadata[topic]?.title || topic}
@@ -599,29 +657,88 @@ const AnnotationPage: React.FC = () => {
                                     </div>
                                 ))}
                             </div>
-                            
+
                             {/* Charts & URDF */}
                             <div className="h-[320px] bg-[#050505] border-t border-gray-800 flex shrink-0">
                                 <div className="w-[33%] border-r border-gray-800 relative bg-gradient-to-b from-gray-900/20 to-transparent">
                                     <div className="absolute top-2 left-3 text-[10px] font-bold text-gray-500 tracking-widest z-10">URDF VISUALIZER</div>
-                                    <UrdfViewer jointState={displayedFrame?.jointState?.position || null} />
+                                    <UrdfViewer
+                                        jointData={displayedFrame?.jointStateMap || null}
+                                        config={urdfConfig}
+                                    />
                                 </div>
                                 <div className="w-[67%] flex flex-col p-3 min-w-0">
                                     <div className="flex justify-between items-center mb-3">
-                                        <div className="flex gap-2">
-                                            <select value={jointSelectionMode} onChange={e => setJointSelectionMode(e.target.value as any)} className="bg-gray-900 border border-gray-700 text-gray-300 text-[10px] font-medium rounded px-3 py-1 outline-none focus:border-cyan-500 transition-colors cursor-pointer hover:bg-gray-800">
-                                                <option value="all">All Joints</option>
-                                                <option value="left">Left Arm</option>
-                                                <option value="right">Right Arm</option>
-                                                <option value="grippers">Grippers</option>
-                                                <option value="single">Single Joint</option>
-                                            </select>
-                                            {jointSelectionMode === 'single' && (
-                                                <select value={singleJointIndex} onChange={e => setSingleJointIndex(Number(e.target.value))} className="bg-gray-900 border border-gray-700 text-gray-300 text-[10px] font-medium rounded px-3 py-1 outline-none cursor-pointer hover:bg-gray-800">
-                                                    {JOINT_NAMES_DEFAULT.map((name, i) => <option key={i} value={i}>{name}</option>)}
-                                                </select>
-                                            )}
+                                        <div className="flex items-center h-8 max-w-[75%] bg-gray-900 border border-gray-700 rounded-lg overflow-hidden">
+                                            
+                                            {/* 1. Scrolling Area: Individual Joints */}
+                                            <div className="flex-1 flex items-center gap-1 overflow-x-auto no-scrollbar px-2 mask-linear-fade">
+                                                {availableJointNames.length === 0 && <span className="text-[10px] text-gray-600 italic">No joints found</span>}
+                                                {availableJointNames.map(name => {
+                                                    const shortName = name.split('/').pop() || name; // Show only 'joint1', etc.
+                                                    const isSelected = selectedJointsToChart.includes(name);
+                                                    return (
+                                                        <button
+                                                            key={name}
+                                                            onClick={() => setSelectedJointsToChart(prev => isSelected ? prev.filter(j => j !== name) : [...prev, name])}
+                                                            className={`
+                                                                shrink-0 px-2 py-0.5 text-[9px] border rounded transition-all whitespace-nowrap
+                                                                ${isSelected 
+                                                                    ? 'bg-cyan-900/40 border-cyan-500/50 text-cyan-400' 
+                                                                    : 'bg-transparent border-gray-700 text-gray-500 hover:border-gray-500'}
+                                                            `}
+                                                            title={name}
+                                                        >
+                                                            {shortName}
+                                                        </button>
+                                                    );
+                                                })}
+                                            </div>
+
+                                            {/* 2. Vertical Divider */}
+                                            <div className="w-px h-4 bg-gray-700 mx-1 shrink-0"></div>
+
+                                            {/* 3. Fixed Area: Topics & Global Controls */}
+                                            <div className="flex items-center gap-2 px-2 shrink-0 bg-gray-800/50 h-full">
+                                                
+                                                {/* Topic Groups */}
+                                                <div className="flex gap-1">
+                                                    {uniqueTopics.map(topic => {
+                                                        const jointsInTopic = availableJointNames.filter(n => n.startsWith(topic + '/'));
+                                                        const activeCount = jointsInTopic.filter(j => selectedJointsToChart.includes(j)).length;
+                                                        const isFull = activeCount === jointsInTopic.length;
+                                                        const isPart = activeCount > 0 && !isFull;
+                                                        // Display name logic: /puppet/joint_left -> joint_left -> left
+                                                        const displayName = topic.split('/').pop()?.replace('joint_', '').toUpperCase().substring(0, 4) || 'GRP';
+
+                                                        return (
+                                                            <button 
+                                                                key={topic} 
+                                                                onClick={() => toggleTopic(topic)}
+                                                                className={`
+                                                                    px-1.5 py-0.5 text-[8px] font-bold border rounded uppercase tracking-wider
+                                                                    ${isFull ? 'bg-indigo-900/50 border-indigo-500 text-indigo-300' : 
+                                                                      isPart ? 'bg-indigo-900/20 border-indigo-500/50 text-indigo-400' : 
+                                                                      'bg-gray-800 border-gray-600 text-gray-500 hover:text-gray-300'}
+                                                                `}
+                                                                title={`Toggle all in ${topic}`}
+                                                            >
+                                                                {displayName}
+                                                            </button>
+                                                        );
+                                                    })}
+                                                </div>
+
+                                                {/* All / None */}
+                                                <div className="flex gap-1 ml-1">
+                                                    <button onClick={() => setSelectedJointsToChart(availableJointNames)} className="text-[9px] font-bold text-gray-400 hover:text-white px-1">ALL</button>
+                                                    <span className="text-gray-700 text-[10px]">/</span>
+                                                    <button onClick={() => setSelectedJointsToChart([])} className="text-[9px] font-bold text-gray-400 hover:text-white px-1">NONE</button>
+                                                </div>
+                                            </div>
                                         </div>
+
+                                        {/* Data Type Selector (Pos/Vel/Eff) */}
                                         <div className="flex bg-gray-900 rounded-lg border border-gray-800 p-0.5">
                                             {['position', 'velocity', 'effort'].map(t => (
                                                 <button key={t} onClick={() => setSelectedJointDataType(t as any)} className={`px-3 py-0.5 text-[10px] font-bold uppercase rounded-md transition-all ${selectedJointDataType === t ? 'bg-cyan-900/50 text-cyan-400 shadow-sm' : 'text-gray-600 hover:text-gray-400'}`}>{t}</button>
@@ -637,7 +754,7 @@ const AnnotationPage: React.FC = () => {
                         <div className="w-[320px] bg-[#080808] border-l border-gray-800 flex flex-col shrink-0 z-20 shadow-[-5px_0_15px_rgba(0,0,0,0.5)]">
                             <div className="p-4 border-b border-gray-800">
                                 <h3 className="text-[10px] font-bold text-gray-500 uppercase tracking-[0.2em] mb-4">Properties</h3>
-                                
+
                                 {/* Subtask Panel */}
                                 {selectedSubtaskId ? (
                                     <div className="space-y-4 animate-fade-in mb-6">
@@ -646,24 +763,24 @@ const AnnotationPage: React.FC = () => {
                                                 <span className="w-2 h-2 rounded-full bg-blue-500"></span>
                                                 SUBTASK
                                             </span>
-                                            <button onClick={()=>setSelectedSubtaskId(null)} className="text-gray-600 hover:text-white transition-colors">✕</button>
+                                            <button onClick={() => setSelectedSubtaskId(null)} className="text-gray-600 hover:text-white transition-colors">✕</button>
                                         </div>
-                                        
+
                                         <div className="grid grid-cols-3 gap-1.5">
                                             {['action', 'adjective', 'object'].map(k => (
                                                 <select key={k} value={(genSelection as any)[k]} onChange={e => updateGenPrompt(k, e.target.value)} className="w-full bg-gray-900 text-[10px] border border-gray-700 rounded px-1 py-1.5 text-gray-300 outline-none focus:border-blue-500 transition-colors cursor-pointer">
-                                                    <option value="">- {k} -</option>{(PROMPT_OPTIONS as any)[k+'s'].map((o:string) => <option key={o} value={o}>{o}</option>)}
+                                                    <option value="">- {k} -</option>{(PROMPT_OPTIONS as any)[k + 's'].map((o: string) => <option key={o} value={o}>{o}</option>)}
                                                 </select>
                                             ))}
                                         </div>
-                                        
-                                        <textarea value={subtasks.find(s=>s.id===selectedSubtaskId)?.prompt || ''} onChange={e => handleSubtaskChange(e.target.value)} className="w-full h-24 bg-gray-900/50 border border-gray-700 rounded p-3 text-xs text-gray-200 resize-none outline-none focus:border-blue-500 focus:bg-gray-900 transition-all placeholder:text-gray-700" placeholder="Type prompt here..." />
-                                        
+
+                                        <textarea value={subtasks.find(s => s.id === selectedSubtaskId)?.prompt || ''} onChange={e => handleSubtaskChange(e.target.value)} className="w-full h-24 bg-gray-900/50 border border-gray-700 rounded p-3 text-xs text-gray-200 resize-none outline-none focus:border-blue-500 focus:bg-gray-900 transition-all placeholder:text-gray-700" placeholder="Type prompt here..." />
+
                                         <div className="grid grid-cols-3 gap-2">
                                             {['good', 'bad', 'accident'].map(q => {
-                                                const isActive = subtasks.find(s=>s.id===selectedSubtaskId)?.quality === q;
-                                                const color = q==='good'?'emerald':q==='bad'?'rose':'amber';
-                                                return <button key={q} onClick={() => { const s=subtasks.find(x=>x.id===selectedSubtaskId); if(s) setSubtasks(subtasks.map(x=>x.id===s.id?{...x,quality:isActive?null:q as any}:x)); }} className={`py-1.5 text-[10px] uppercase font-bold rounded border transition-all ${isActive?`bg-${color}-500/10 text-${color}-400 border-${color}-500/50 shadow-[0_0_10px_rgba(0,0,0,0.3)]`:'bg-gray-900 text-gray-600 border-gray-800 hover:border-gray-600 hover:text-gray-400'}`}>{q}</button>
+                                                const isActive = subtasks.find(s => s.id === selectedSubtaskId)?.quality === q;
+                                                const color = q === 'good' ? 'emerald' : q === 'bad' ? 'rose' : 'amber';
+                                                return <button key={q} onClick={() => { const s = subtasks.find(x => x.id === selectedSubtaskId); if (s) setSubtasks(subtasks.map(x => x.id === s.id ? { ...x, quality: isActive ? null : q as any } : x)); }} className={`py-1.5 text-[10px] uppercase font-bold rounded border transition-all ${isActive ? `bg-${color}-500/10 text-${color}-400 border-${color}-500/50 shadow-[0_0_10px_rgba(0,0,0,0.3)]` : 'bg-gray-900 text-gray-600 border-gray-800 hover:border-gray-600 hover:text-gray-400'}`}>{q}</button>
                                             })}
                                         </div>
 
@@ -686,7 +803,7 @@ const AnnotationPage: React.FC = () => {
                                                 <span className="w-2 h-2 rounded-full bg-purple-500"></span>
                                                 CONTACT
                                             </span>
-                                            <button onClick={()=>setSelectedContactId(null)} className="text-gray-600 hover:text-white">✕</button>
+                                            <button onClick={() => setSelectedContactId(null)} className="text-gray-600 hover:text-white">✕</button>
                                         </div>
                                         <div className="text-[10px] text-gray-500 font-mono">
                                             ID: <span className="text-gray-300">{selectedContactId.split('-')[1]}</span>
@@ -698,7 +815,7 @@ const AnnotationPage: React.FC = () => {
                                 ) : !selectedSubtaskId && (
                                     <div className="flex flex-col items-center justify-center py-12 text-center opacity-40">
                                         <svg className="w-8 h-8 mb-2 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" /></svg>
-                                        <p className="text-xs font-medium text-gray-500">Select an item on the timeline<br/>to edit properties</p>
+                                        <p className="text-xs font-medium text-gray-500">Select an item on the timeline<br />to edit properties</p>
                                     </div>
                                 )}
                             </div>
@@ -723,7 +840,7 @@ const AnnotationPage: React.FC = () => {
                                     className="h-full relative cursor-crosshair"
                                     style={{
                                         width: `100%`,
-                                        minWidth: '100%' 
+                                        minWidth: '100%'
                                     }}
                                     onMouseMove={handleTimelineMouseMove}
                                     onMouseLeave={handleTimelineMouseLeave}
@@ -772,7 +889,7 @@ const AnnotationPage: React.FC = () => {
                                     {/* Track 2: Contacts (Bottom Half) */}
                                     <div
                                         className="absolute bottom-0 h-1/2 w-full cursor-crosshair overflow-hidden group/track2 hover:bg-white/5 transition-colors"
-                                        onClick={handleContactTrackClick} 
+                                        onClick={handleContactTrackClick}
                                         onContextMenu={handleContactTrackContextMenu}
                                     >
                                         <div className="absolute top-0 left-0 bg-purple-900/80 text-[9px] px-1.5 py-px text-blue-200 z-40 pointer-events-none rounded-br shadow-sm">Contacts</div>
@@ -799,7 +916,7 @@ const AnnotationPage: React.FC = () => {
                                                     className={`absolute top-1.5 bottom-1.5 bg-purple-500/40 border border-purple-400/80 rounded-sm hover:bg-purple-500/60 group transition-all backdrop-blur-[1px] ${isSelected ? 'border-yellow-400 ring-1 ring-yellow-400 z-10' : ''}`}
                                                     style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
                                                     onClick={(e) => {
-                                                        e.stopPropagation(); 
+                                                        e.stopPropagation();
                                                         handleTimelineClick(e);
                                                     }}
                                                     title={`Contact created by: ${contact.username || 'Unknown'}`}
@@ -854,6 +971,14 @@ const AnnotationPage: React.FC = () => {
                     </div>
                 </>
             )}
+
+            <UrdfSettingsDialog
+                isOpen={isSettingsOpen}
+                onClose={() => setIsSettingsOpen(false)}
+                config={urdfConfig}
+                onSave={setUrdfConfig}
+                bagService={bagService}
+            />
         </div>
     );
 };
