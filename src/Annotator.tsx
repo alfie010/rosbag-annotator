@@ -187,15 +187,93 @@ const AnnotationPage: React.FC = () => {
             setDisplayedFrame(frame0);
             setCurrentFrameIndex(0);
 
-            // Default Subtask
-            setSubtasks([{
-                id: generateUniqueId(),
-                username: 'local',
-                start: 0,
-                end: bagService.timestamps.length - 1,
-                quality: null,
-                prompt: ''
-            }]);
+            // Auto-generate Subtasks from /puppet/task_state if available
+            const taskHistory = bagService.historicalTaskState;
+            const totalFrames = bagService.timestamps.length;
+            
+            const hasTaskData = Array.from(taskHistory.values()).some(val => val && val.trim() !== '');
+
+            if (hasTaskData && totalFrames > 0) {
+                
+                // Parse and format the task label according to custom rules
+                const parseTaskLabel = (rawStr: string): string => {
+                    if (!rawStr) return '';
+                    try {
+                        const data = JSON.parse(rawStr);
+                        const { phase, instruction } = data;
+
+                        // Apply custom rules
+                        if (phase === 'move') {
+                            return 'move';
+                        }
+                        if (phase === 'pick') {
+                            return `pick the ${instruction} cable`;
+                        }
+                        if (phase === 'insert') {
+                            return `insert the ${instruction} cable`;
+                        }
+
+                        // Fallback logic: if other phases appear, concatenate directly
+                        return `${phase} ${instruction || ''}`.trim();
+                    } catch (e) {
+                        // If not JSON, return the original string
+                        return rawStr;
+                    }
+                };
+
+                const newSubtasks: SubtaskAnnotation[] = [];
+                
+                // Initialize state (compare using parsed text, ignoring ts_ns changes)
+                let currentFormattedLabel = parseTaskLabel(taskHistory.get(0) || '');
+                let startFrame = 0;
+
+                for (let i = 1; i < totalFrames; i++) {
+                    const raw = taskHistory.get(i) || '';
+                    const nextFormattedLabel = parseTaskLabel(raw);
+                    
+                    // Only create a new segment when the "semantic text" changes
+                    if (nextFormattedLabel !== currentFormattedLabel) {
+                        // Save the previous segment
+                        if (currentFormattedLabel !== '') {
+                             newSubtasks.push({
+                                id: generateUniqueId(),
+                                username: 'auto',
+                                start: startFrame,
+                                end: i - 1,
+                                quality: null,
+                                prompt: currentFormattedLabel
+                            });
+                        }
+                        // Start a new segment
+                        currentFormattedLabel = nextFormattedLabel;
+                        startFrame = i;
+                    }
+                }
+
+                // Add the final segment
+                if (currentFormattedLabel !== '') {
+                    newSubtasks.push({
+                        id: generateUniqueId(),
+                        username: 'auto',
+                        start: startFrame,
+                        end: totalFrames - 1,
+                        quality: null,
+                        prompt: currentFormattedLabel
+                    });
+                }
+
+                setSubtasks(newSubtasks);
+            } else {
+                // Fallback: Default single subtask
+                setSubtasks([{
+                    id: generateUniqueId(),
+                    username: 'local',
+                    start: 0,
+                    end: bagService.timestamps.length - 1,
+                    quality: null,
+                    prompt: ''
+                }]);
+            }
 
             setIsFileLoaded(true);
         } catch (err: any) {

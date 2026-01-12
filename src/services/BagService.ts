@@ -7,6 +7,10 @@ interface Time {
     nsec: number;
 }
 
+interface StringMsg {
+    data: string;
+}
+
 export interface JointStateMsg {
     header?: any;
     name: string[];
@@ -51,10 +55,12 @@ export class BagService {
     public timestamps: number[] = []; 
     public topicMetadata: Record<string, { msgType: string; title: string }> = {};
     public historicalJointData: Map<number, Record<string, JointStateMsg>> = new Map();
+    public historicalTaskState: Map<number, string> = new Map();
 
     // --- Private State ---
     private imageTopics: string[] = [];
     private jointTopics: string[] = [];
+    private stringTopics: string[] = [];
     private frameImageIndex = new Map<number, FrameImageMap>(); // FrameIndex -> { Topic -> ExactTimestamp }
     private frameCache = new Map<number, ParsedFrame>();
 
@@ -80,6 +86,10 @@ export class BagService {
                     this.topicMetadata[conn.topic] = { msgType: conn.type, title: conn.topic };
                     this.jointTopics.push(conn.topic);
                 }
+                if (conn.type === 'std_msgs/String') {
+                    this.topicMetadata[conn.topic] = { msgType: conn.type, title: conn.topic };
+                    this.stringTopics.push(conn.topic);
+                }
                 console.log(conn);
             }
             
@@ -87,7 +97,7 @@ export class BagService {
             this.imageTopics.sort();
             this.jointTopics.sort();
 
-            const targetTopics = [...this.imageTopics, ...this.jointTopics];
+            const targetTopics = [...this.imageTopics, ...this.jointTopics, ...this.stringTopics];
             if (targetTopics.length === 0) throw new Error("No compatible topics found.");
 
             // 2. Extract All Messages
@@ -105,7 +115,7 @@ export class BagService {
                 };
 
                 // For JointState, we need the full data
-                if (this.jointTopics.includes(msg.topic)) {
+                if (this.jointTopics.includes(msg.topic) || this.stringTopics.includes(msg.topic)) {
                     lightMsg.data = msg.message;
                 }
                 // Otherwise, for Image, we only need the timestamp
@@ -127,6 +137,8 @@ export class BagService {
             const currentJoints: Record<string, any> = {}; 
             const currentImageTimes = new Map<string, Time>();
 
+            let currentTaskState = '';
+
             for (let i = 0; i < allMessages.length; i++) {
                 const msg = allMessages[i];
                 seenTopics.add(msg.topic);
@@ -134,12 +146,20 @@ export class BagService {
                 // Update current state
                 if (this.jointTopics.includes(msg.topic)) {
                     currentJoints[msg.topic] = msg.data;
+                } else if (this.stringTopics.includes(msg.topic)) {
+                    // Update task state if topic matches
+                    if (msg.topic === '/puppet/task_state') {
+                        currentTaskState = (msg.data as StringMsg).data;
+                    }
                 } else {
                     currentImageTimes.set(msg.topic, msg.originalTime);
                 }
 
                 // Check if all topics have been seen
-                const allReady = targetTopics.every(t => seenTopics.has(t));
+                // Note: We don't strictly require task_state to be present to start the timeline
+                // so we only check image/joint readiness for 'allReady'
+                const vitalTopics = [...this.imageTopics, ...this.jointTopics];
+                const allReady = vitalTopics.every(t => seenTopics.has(t));
                 if (allReady) {
                     firstFullStateTime = msg.timestamp;
                     startMsgIndex = i; // Start from the next message
@@ -171,6 +191,11 @@ export class BagService {
                     // Update current state
                     if (this.jointTopics.includes(msg.topic)) {
                         currentJoints[msg.topic] = msg.data;
+                    } else if (this.stringTopics.includes(msg.topic)) {
+                        // Update current state
+                        if (msg.topic === '/puppet/task_state') {
+                            currentTaskState = (msg.data as StringMsg).data;
+                        }
                     } else {
                         currentImageTimes.set(msg.topic, msg.originalTime);
                     }
@@ -180,6 +205,7 @@ export class BagService {
                 // Snapshot data for this frame
                 this.snapshotJointData(frameIdx, currentJoints);
                 this.frameImageIndex.set(frameIdx, new Map(currentImageTimes));
+                this.historicalTaskState.set(frameIdx, currentTaskState);
             }
 
             onProgress?.('');
@@ -220,9 +246,11 @@ export class BagService {
         this.timestamps = [];
         this.topicMetadata = {};
         this.historicalJointData.clear();
+        this.historicalTaskState.clear();
         this.frameImageIndex.clear();
         this.imageTopics = [];
         this.jointTopics = [];
+        this.stringTopics = [];
         this.bag = null;
     }
 
