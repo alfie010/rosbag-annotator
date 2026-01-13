@@ -56,31 +56,27 @@ export const RM75_CONFIG = {
 // Available: data['/topic/name']
 // Return: { 'urdf_joint_name': angle_radians }
 
-const left = data['/puppet/joint_left'];
-const right = data['/puppet/joint_right'];
 const map = {};
 
-if (left) {
-    const pos = left.position;
-    map['left_joint1'] = pos[0];
-    map['left_joint2'] = pos[1];
-    map['left_joint3'] = pos[2];
-    map['left_joint4'] = pos[3];
-    map['left_joint5'] = pos[4];
-    map['left_joint6'] = pos[5];
-    map['left_joint7'] = pos[6];
+const left = data['/puppet/joint_left'];
+const right = data['/puppet/joint_right'];
+
+if (left && left.position) {
+    const p = left.position;
+    map['left_joint1'] = p[0]; map['left_joint2'] = p[1]; map['left_joint3'] = p[2];
+    map['left_joint4'] = p[3]; map['left_joint5'] = p[4]; map['left_joint6'] = p[5]; map['left_joint7'] = p[6];
 }
 
-if (right) {
-    const pos = right.position;
-    map['right_joint1'] = pos[0];
-    map['right_joint2'] = pos[1];
-    map['right_joint3'] = pos[2];
-    map['right_joint4'] = pos[3];
-    map['right_joint5'] = pos[4];
-    map['right_joint6'] = pos[5];
-    map['right_joint7'] = pos[6];
+if (right && right.position) {
+    const p = right.position;
+    map['right_joint1'] = p[0]; map['right_joint2'] = p[1]; map['right_joint3'] = p[2];
+    map['right_joint4'] = p[3]; map['right_joint5'] = p[4]; map['right_joint6'] = p[5]; map['right_joint7'] = p[6];
 }
+
+left_gripper = data['/puppet/left_gripper_state'].position[0] / 255 * 0.45;
+right_gripper = data['/puppet/right_gripper_state'].position[0] / 255 * 0.45;
+map['left_finger_joint'] = left_gripper;
+map['right_finger_joint'] = right_gripper;
 
 return map;
 `
