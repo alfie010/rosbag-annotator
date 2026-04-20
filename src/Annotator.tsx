@@ -32,27 +32,12 @@ interface SubtaskAnnotation {
     prompt: string;
 }
 
-interface ContactAnnotation {
-    id: string;
-    username: string;
-    start: number;
-    end: number;
-}
-
-interface DraggingState {
-    type: 'contact';
-    id: string;
-    edge: 'start' | 'end';
-}
-
 // --- Constants ---
 const PROMPT_OPTIONS = {
     actions: ['pick', 'place', 'move', 'push', 'wipe', 'hold'],
     adjectives: ['red', 'blue', 'metal', 'wooden', 'soft', 'heavy'],
     objects: ['cube', 'block', 'apple', 'banana', 'cloth', 'tool']
 };
-
-const MIN_CONTACT_FRAMES = 5;
 
 const PLACEHOLDER_IMG = 'data:image/svg+xml;charset=UTF-8,%3csvg xmlns="http://www.w3.org/2000/svg" width="640" height="480"%3e%3crect width="100%25" height="100%25" fill="%230f172a"/%3e%3ctext x="50%25" y="50%25" fill="%23334155" font-family="monospace" font-size="20px" dominant-baseline="middle" text-anchor="middle"%3eNO SIGNAL%3c/text%3e%3c/svg%3e';
 
@@ -93,6 +78,7 @@ const AnnotationPage: React.FC = () => {
 
     // --- State: Visuals ---
     const [orderedImageTopics, setOrderedImageTopics] = useState<string[]>([]);
+    const [visibleImageTopics, setVisibleImageTopics] = useState<string[]>([]);
     const [draggedTopic, setDraggedTopic] = useState<string | null>(null);
     const [historicalJointData, setHistoricalJointData] = useState<Map<number, Record<string, JointStateMsg>>>(new Map());
     const [availableJointNames, setAvailableJointNames] = useState<string[]>([]);
@@ -103,14 +89,10 @@ const AnnotationPage: React.FC = () => {
 
     // --- State: Annotation ---
     const [subtasks, setSubtasks] = useState<SubtaskAnnotation[]>([]);
-    const [contacts, setContacts] = useState<ContactAnnotation[]>([]);
     const [selectedSubtaskId, setSelectedSubtaskId] = useState<string | null>(null);
-    const [selectedContactId, setSelectedContactId] = useState<string | null>(null);
-    const [pendingContactStart, setPendingContactStart] = useState<number | null>(null);
 
     // --- State: Interaction ---
     const [hoveredFrame, setHoveredFrame] = useState<{ index: number | null, percent: number }>({ index: null, percent: 0 });
-    const [draggingState, setDraggingState] = useState<DraggingState | null>(null);
     const [genSelection, setGenSelection] = useState({ action: '', adjective: '', object: '' });
 
     // --- Refs ---
@@ -125,9 +107,7 @@ const AnnotationPage: React.FC = () => {
         setLoadingMessage('Initializing Reader...');
 
         // --- RESET STATE ---
-        setContacts([]);      // Clear contacts
         setSubtasks([]);     // Clear subtasks
-        setSelectedContactId(null);
         setSelectedSubtaskId(null);
         // -------------------
 
@@ -167,6 +147,7 @@ const AnnotationPage: React.FC = () => {
             // Try to recover layout from LocalStorage
             const topicKeysString = Object.keys(bagService.topicMetadata).sort().join('-');
             const savedLayoutJson = localStorage.getItem(`rosbag-layout-${topicKeysString}`);
+            const savedVisibleJson = localStorage.getItem(`rosbag-visible-topics-${topicKeysString}`);
 
             if (savedLayoutJson) {
                 try {
@@ -181,6 +162,18 @@ const AnnotationPage: React.FC = () => {
                 }
             } else {
                 setOrderedImageTopics(allImageTopics);
+            }
+
+            if (savedVisibleJson) {
+                try {
+                    const savedVisible = JSON.parse(savedVisibleJson);
+                    const validVisible = savedVisible.filter((t: string) => allImageTopics.includes(t));
+                    setVisibleImageTopics(validVisible);
+                } catch (e) {
+                    setVisibleImageTopics(allImageTopics);
+                }
+            } else {
+                setVisibleImageTopics(allImageTopics);
             }
 
             const frame0 = await bagService.getFrameAt(0);
@@ -306,8 +299,7 @@ const AnnotationPage: React.FC = () => {
                 totalFrames: timestamps.length,
                 duration: timestamps.length > 0 ? timestamps[timestamps.length - 1] - timestamps[0] : 0
             },
-            subtasks,
-            contacts
+            subtasks
         };
         const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
@@ -390,6 +382,13 @@ const AnnotationPage: React.FC = () => {
         }
     }, [orderedImageTopics, isFileLoaded, topicMetadata]);
 
+    useEffect(() => {
+        if (isFileLoaded && topicMetadata) {
+            const topicKeysString = Object.keys(topicMetadata).sort().join('-');
+            localStorage.setItem(`rosbag-visible-topics-${topicKeysString}`, JSON.stringify(visibleImageTopics));
+        }
+    }, [visibleImageTopics, isFileLoaded, topicMetadata]);
+
     // 4. Annotation Logic (Subtasks & Contacts)
 
     // --- Subtask ---
@@ -443,105 +442,6 @@ const AnnotationPage: React.FC = () => {
         }
     };
 
-    // --- Contact Creation Logic ---
-    const finishContactCreation = (endIndex: number) => {
-        if (pendingContactStart === null) return;
-        let start = Math.min(pendingContactStart, endIndex);
-        let end = Math.max(pendingContactStart, endIndex);
-        if (end - start < MIN_CONTACT_FRAMES) end = Math.min(timestamps.length - 1, start + MIN_CONTACT_FRAMES);
-
-        setContacts([...contacts, { id: generateUniqueId(), username: 'local', start, end }]);
-        setPendingContactStart(null);
-    };
-
-    const handleContactTrackContextMenu = (e: React.MouseEvent) => {
-        e.preventDefault(); e.stopPropagation();
-        if (hoveredFrame.index === null) return;
-
-        if (pendingContactStart === null) {
-            setPendingContactStart(hoveredFrame.index);
-        } else {
-            finishContactCreation(hoveredFrame.index);
-        }
-    };
-
-    const handleContactTrackClick = (e: React.MouseEvent) => {
-        e.stopPropagation();
-        if (pendingContactStart !== null && hoveredFrame.index !== null) {
-            finishContactCreation(hoveredFrame.index);
-        } else {
-            handleTimelineClick(e);
-            setSelectedContactId(null);
-        }
-    };
-
-    useEffect(() => {
-        const handleKeyDown = (e: KeyboardEvent) => {
-            // Only trigger if a contact is selected and we are not typing in an input
-            if ((e.key === 'Delete' || e.key === 'Backspace') && selectedContactId) {
-                const activeElement = document.activeElement;
-                const isInput = activeElement?.tagName === 'INPUT' || activeElement?.tagName === 'TEXTAREA';
-
-                if (!isInput) {
-                    handleDeleteContact();
-                }
-            }
-        };
-
-        window.addEventListener('keydown', handleKeyDown);
-        return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [selectedContactId]); // Re-bind when selection changes
-
-    // --- Contact Dragging/Resizing Logic ---
-    const handleMouseDownOnHandle = (e: React.MouseEvent, type: 'contact', id: string, edge: 'start' | 'end') => {
-        e.stopPropagation(); e.preventDefault();
-        setDraggingState({ type, id, edge });
-    };
-
-    // Global Drag Effect for Timeline
-    useEffect(() => {
-        const handleGlobalMouseMove = (e: MouseEvent) => {
-            if (!draggingState || !timelineInnerRef.current || timestamps.length === 0) return;
-            const rect = timelineInnerRef.current.getBoundingClientRect();
-            const x = e.clientX - rect.left;
-            const newIndex = Math.round((x / rect.width) * (timestamps.length - 1));
-            const clampedIndex = Math.max(0, Math.min(timestamps.length - 1, newIndex));
-
-            if (draggingState.type === 'contact') {
-                setContacts(prev => prev.map(c => {
-                    if (c.id !== draggingState.id) return c;
-                    const newC = { ...c };
-                    if (draggingState.edge === 'start') {
-                        newC.start = Math.min(clampedIndex, c.end - MIN_CONTACT_FRAMES);
-                    } else {
-                        newC.end = Math.max(clampedIndex, c.start + MIN_CONTACT_FRAMES);
-                    }
-                    return newC;
-                }));
-            }
-        };
-
-        const handleGlobalMouseUp = () => {
-            if (draggingState) setDraggingState(null);
-        };
-
-        if (draggingState) {
-            window.addEventListener('mousemove', handleGlobalMouseMove);
-            window.addEventListener('mouseup', handleGlobalMouseUp);
-        }
-        return () => {
-            window.removeEventListener('mousemove', handleGlobalMouseMove);
-            window.removeEventListener('mouseup', handleGlobalMouseUp);
-        };
-    }, [draggingState, timestamps]);
-
-    const handleDeleteContact = () => {
-        if (!selectedContactId) return;
-        setContacts(prev => prev.filter(c => c.id !== selectedContactId));
-        setSelectedContactId(null);
-    };
-
-
     // 5. Timeline General Handlers
     const handleTimelineClick = (e: React.MouseEvent) => {
         if (!timelineInnerRef.current || timestamps.length === 0) return;
@@ -553,9 +453,7 @@ const AnnotationPage: React.FC = () => {
         setIsPlaying(false);
 
         const sub = subtasks.find(s => index >= s.start && index <= s.end);
-        setSelectedSubtaskId(sub ? sub.id : null);
-        const contact = contacts.find(c => index >= c.start && index <= c.end);
-        setSelectedContactId(contact ? contact.id : null);
+        setSelectedSubtaskId(sub?.id === selectedSubtaskId ? null : (sub ? sub.id : null));
     };
 
     const handleTimelineMouseMove = (e: React.MouseEvent) => {
@@ -591,6 +489,19 @@ const AnnotationPage: React.FC = () => {
             // Select all (Union)
             setSelectedJointsToChart(prev => Array.from(new Set([...prev, ...jointsInTopic])));
         }
+    };
+
+    const visibleOrderedImageTopics = useMemo(
+        () => orderedImageTopics.filter(topic => visibleImageTopics.includes(topic)),
+        [orderedImageTopics, visibleImageTopics]
+    );
+
+    const toggleImageTopicVisibility = (topic: string) => {
+        setVisibleImageTopics(prev => (
+            prev.includes(topic)
+                ? prev.filter(t => t !== topic)
+                : orderedImageTopics.filter(t => t === topic || prev.includes(t))
+        ));
     };
 
     // --- Chart Data & Options ---
@@ -640,7 +551,7 @@ const AnnotationPage: React.FC = () => {
             responsive: true, maintainAspectRatio: false, animation: false,
             interaction: { mode: 'index', intersect: false },
             plugins: {
-                legend: { display: true, labels: { color: '#94a3b8', font: { family: 'monospace', size: 10 }, boxWidth: 10 } },
+                legend: { display: false },
                 tooltip: { enabled: true, backgroundColor: 'rgba(15, 23, 42, 0.9)', titleColor: '#22d3ee', bodyFont: { family: 'monospace' } },
                 annotation: {
                     annotations: {
@@ -722,22 +633,26 @@ const AnnotationPage: React.FC = () => {
                     <div className="flex-1 flex overflow-hidden">
                         {/* Visualizer Area */}
                         <div className="flex-1 flex flex-col border-r border-gray-800 min-w-0">
-                            {/* Images Grid - Forced grid-cols-3 */}
-                            <div className="flex-grow bg-[#020202] p-2 grid grid-cols-3 gap-2 overflow-y-auto content-start custom-scrollbar">
-                                {orderedImageTopics.map((topic) => (
+                            <div className="flex-grow bg-[#020202] p-2 grid grid-cols-3 gap-2 overflow-y-auto content-start custom-scrollbar auto-rows-max">
+                                {visibleOrderedImageTopics.map((topic) => (
                                     <div key={topic} draggable onDragStart={(e) => handleImageDragStart(e, topic)} onDrop={(e) => handleImageDrop(e, topic)} onDragOver={(e) => e.preventDefault()}
-                                        className={`relative aspect-[4/3] rounded-lg border border-gray-800 bg-gray-900/50 overflow-hidden group transition-all hover:border-gray-600 ${draggedTopic === topic ? 'opacity-40 ring-2 ring-cyan-500 border-transparent' : ''}`}
+                                        className={`relative self-start rounded-lg border border-gray-800 bg-gray-900/50 overflow-hidden group transition-all hover:border-gray-600 ${draggedTopic === topic ? 'opacity-40 ring-2 ring-cyan-500 border-transparent' : ''}`}
                                     >
-                                        <div className="absolute top-2 left-2 px-2 py-1 bg-black/80 backdrop-blur text-[10px] font-bold text-cyan-400 border border-white/5 rounded shadow-lg z-10 pointer-events-none select-none tracking-tight">
-                                            {topicMetadata[topic]?.title || topic}
+                                        <div className="pointer-events-none absolute left-2 top-2 z-10 max-w-[calc(100%-1rem)] rounded bg-black/75 px-2 py-1 text-[10px] text-cyan-300 opacity-0 transition-opacity group-hover:opacity-100">
+                                            <span className="block truncate">{topicMetadata?.[topic]?.title || topic}</span>
                                         </div>
-                                        <img src={displayedFrame?.images[topic] || PLACEHOLDER_IMG} className="w-full h-full object-contain select-none" alt={topic} />
+                                        <img src={displayedFrame?.images[topic] || PLACEHOLDER_IMG} className="block h-auto w-full select-none" alt={topic} />
                                     </div>
                                 ))}
+                                {visibleOrderedImageTopics.length === 0 && (
+                                    <div className="col-span-3 flex min-h-[220px] items-center justify-center rounded-lg border border-dashed border-gray-800 bg-gray-900/20 text-xs text-gray-500">
+                                        No image topics selected
+                                    </div>
+                                )}
                             </div>
 
                             {/* Charts & URDF */}
-                            <div className="h-[320px] bg-[#050505] border-t border-gray-800 flex shrink-0">
+                            <div className="h-[240px] bg-[#050505] border-t border-gray-800 flex shrink-0">
                                 <div className="w-[33%] border-r border-gray-800 relative bg-gradient-to-b from-gray-900/20 to-transparent">
                                     <div className="absolute top-2 left-3 text-[10px] font-bold text-gray-500 tracking-widest z-10">URDF VISUALIZER</div>
                                     <UrdfViewer
@@ -833,6 +748,48 @@ const AnnotationPage: React.FC = () => {
                             <div className="p-4 border-b border-gray-800">
                                 <h3 className="text-[10px] font-bold text-gray-500 uppercase tracking-[0.2em] mb-4">Properties</h3>
 
+                                <div className="mb-6 rounded-lg border border-gray-800 bg-gray-900/30 p-3">
+                                    <div className="mb-3 flex items-center justify-between gap-2">
+                                        <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-500">Visualizer Topics</span>
+                                        <div className="flex items-center gap-1">
+                                            <button
+                                                onClick={() => setVisibleImageTopics(orderedImageTopics)}
+                                                className="px-1.5 py-0.5 text-[9px] font-bold text-gray-400 transition-colors hover:text-white"
+                                            >
+                                                ALL
+                                            </button>
+                                            <span className="text-[10px] text-gray-700">/</span>
+                                            <button
+                                                onClick={() => setVisibleImageTopics([])}
+                                                className="px-1.5 py-0.5 text-[9px] font-bold text-gray-400 transition-colors hover:text-white"
+                                            >
+                                                NONE
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div className="flex flex-wrap gap-2">
+                                        {orderedImageTopics.map(topic => {
+                                            const isVisible = visibleImageTopics.includes(topic);
+                                            return (
+                                                <button
+                                                    key={topic}
+                                                    onClick={() => toggleImageTopicVisibility(topic)}
+                                                    className={`max-w-full rounded border px-2 py-1 text-[10px] transition-colors ${
+                                                        isVisible
+                                                            ? 'border-cyan-500/50 bg-cyan-900/30 text-cyan-300'
+                                                            : 'border-gray-700 bg-gray-900 text-gray-500 hover:border-gray-500 hover:text-gray-300'
+                                                    }`}
+                                                    title={topic}
+                                                >
+                                                    <span className="block max-w-[220px] truncate">
+                                                        {topicMetadata?.[topic]?.title || topic}
+                                                    </span>
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+
                                 {/* Subtask Panel */}
                                 {selectedSubtaskId ? (
                                     <div className="space-y-4 animate-fade-in mb-6">
@@ -841,7 +798,15 @@ const AnnotationPage: React.FC = () => {
                                                 <span className="w-2 h-2 rounded-full bg-blue-500"></span>
                                                 SUBTASK
                                             </span>
-                                            <button onClick={() => setSelectedSubtaskId(null)} className="text-gray-600 hover:text-white transition-colors">✕</button>
+                                            <div className="flex items-center gap-2">
+                                                <button
+                                                    onClick={() => setSelectedSubtaskId(null)}
+                                                    className="rounded border border-gray-700 px-2 py-1 text-[9px] font-bold uppercase text-gray-400 transition-colors hover:border-gray-500 hover:text-white"
+                                                >
+                                                    Unselect
+                                                </button>
+                                                <button onClick={() => setSelectedSubtaskId(null)} className="text-gray-600 hover:text-white transition-colors">✕</button>
+                                            </div>
                                         </div>
 
                                         <div className="grid grid-cols-3 gap-1.5">
@@ -873,24 +838,7 @@ const AnnotationPage: React.FC = () => {
                                     </div>
                                 ) : null}
 
-                                {/* Contact Panel */}
-                                {selectedContactId ? (
-                                    <div className="space-y-4 animate-fade-in p-4 border border-purple-500/30 rounded-lg bg-purple-900/5 shadow-inner">
-                                        <div className="flex items-center justify-between">
-                                            <span className="text-xs font-bold text-purple-400 flex items-center gap-2">
-                                                <span className="w-2 h-2 rounded-full bg-purple-500"></span>
-                                                CONTACT
-                                            </span>
-                                            <button onClick={() => setSelectedContactId(null)} className="text-gray-600 hover:text-white">✕</button>
-                                        </div>
-                                        <div className="text-[10px] text-gray-500 font-mono">
-                                            ID: <span className="text-gray-300">{selectedContactId.split('-')[1]}</span>
-                                        </div>
-                                        <button onClick={handleDeleteContact} className="w-full py-2 bg-rose-950/30 hover:bg-rose-900/50 text-rose-500 hover:text-rose-400 border border-rose-900/50 rounded text-xs font-bold tracking-wide transition-all uppercase">
-                                            Delete Contact
-                                        </button>
-                                    </div>
-                                ) : !selectedSubtaskId && (
+                                {!selectedSubtaskId && (
                                     <div className="flex flex-col items-center justify-center py-12 text-center opacity-40">
                                         <svg className="w-8 h-8 mb-2 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" /></svg>
                                         <p className="text-xs font-medium text-gray-500">Select an item on the timeline<br />to edit properties</p>
@@ -901,7 +849,7 @@ const AnnotationPage: React.FC = () => {
                     </div>
 
                     {/* TIMELINE SECTION */}
-                    <div className="h-[15%] w-full bg-gray-900 border-t border-gray-700 flex flex-col px-4 py-2 select-none shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.3)] z-20">
+                    <div className="h-[11%] w-full bg-gray-900 border-t border-gray-700 flex flex-col px-4 py-2 select-none shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.3)] z-20">
                         <div className="flex items-center gap-4 h-full">
 
                             {/* Time */}
@@ -936,9 +884,9 @@ const AnnotationPage: React.FC = () => {
                                             style={{ left: hoveredFrame.percent + '%' }} />
                                     )}
 
-                                    {/* Track 1: Subtasks (Top Half) */}
+                                    {/* Track: Subtasks */}
                                     <div
-                                        className="absolute top-0 h-1/2 w-full border-b border-gray-700/50 cursor-pointer overflow-hidden group/track1 hover:bg-white/5 transition-colors"
+                                        className="absolute inset-0 w-full cursor-pointer overflow-hidden group/track1 hover:bg-white/5 transition-colors"
                                         onClick={handleTimelineClick}
                                         onContextMenu={handleSubtaskContextMenu}
                                     >
@@ -953,57 +901,15 @@ const AnnotationPage: React.FC = () => {
 
                                             return (
                                                 <div key={anno.id}
-                                                    className={`absolute top-1 bottom-1 border-l border-r flex items-center justify-center rounded-sm backdrop-blur-[1px] ${bgColor} ${anno.id === selectedSubtaskId ? 'border-2 border-yellow-400 z-10' : ''}`}
+                                                    className={`absolute top-1 bottom-1 border-l border-r rounded-sm backdrop-blur-[1px] ${bgColor} ${anno.id === selectedSubtaskId ? 'border-2 border-yellow-400 z-10' : ''}`}
                                                     style={{ left: `${left}%`, width: `${width}%` }}
-                                                    title={`User: ${anno.username || 'Unknown'}\nPrompt: ${anno.prompt || 'None'}`}
+                                                    title={`Prompt: ${anno.prompt || 'None'}`}
                                                 >
-                                                    {anno.username && <span className="absolute top-0 right-0 text-[8px] bg-black/40 text-white px-1 rounded-bl">{anno.username.slice(0, 3)}</span>}
-                                                    {anno.prompt && <span className="text-[10px] text-white shadow-black drop-shadow-md truncate px-1 pointer-events-none">{anno.prompt}</span>}
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-
-                                    {/* Track 2: Contacts (Bottom Half) */}
-                                    <div
-                                        className="absolute bottom-0 h-1/2 w-full cursor-crosshair overflow-hidden group/track2 hover:bg-white/5 transition-colors"
-                                        onClick={handleContactTrackClick}
-                                        onContextMenu={handleContactTrackContextMenu}
-                                    >
-                                        <div className="absolute top-0 left-0 bg-purple-900/80 text-[9px] px-1.5 py-px text-blue-200 z-40 pointer-events-none rounded-br shadow-sm">Contacts</div>
-
-                                        {/* Pending Creation Preview */}
-                                        {pendingContactStart !== null && hoveredFrame.index !== null && (
-                                            <div
-                                                className="absolute top-1 bottom-1 bg-yellow-400/20 border-l border-r border-dashed border-yellow-400 pointer-events-none z-20"
-                                                style={{
-                                                    left: `${(Math.min(pendingContactStart, hoveredFrame.index) / (timestamps.length - 1 || 1)) * 100}%`,
-                                                    width: `${(Math.max(MIN_CONTACT_FRAMES, Math.abs(hoveredFrame.index - pendingContactStart)) / (timestamps.length - 1 || 1)) * 100}%`
-                                                }}
-                                            />
-                                        )}
-
-                                        {contacts.map(contact => {
-                                            const left = (contact.start / (timestamps.length - 1 || 1)) * 100;
-                                            const width = ((contact.end - contact.start + 1) / (timestamps.length - 1 || 1)) * 100;
-                                            const isSelected = contact.id === selectedContactId;
-
-                                            return (
-                                                <div
-                                                    key={contact.id}
-                                                    className={`absolute top-1.5 bottom-1.5 bg-purple-500/40 border border-purple-400/80 rounded-sm hover:bg-purple-500/60 group transition-all backdrop-blur-[1px] ${isSelected ? 'border-yellow-400 ring-1 ring-yellow-400 z-10' : ''}`}
-                                                    style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
-                                                    onClick={(e) => {
-                                                        e.stopPropagation();
-                                                        handleTimelineClick(e);
-                                                    }}
-                                                    title={`Contact created by: ${contact.username || 'Unknown'}`}
-                                                >
-                                                    {/* Drag Handles */}
-                                                    <div className="absolute left-0 top-0 bottom-0 w-3 -ml-1.5 cursor-ew-resize hover:bg-white/30 z-20"
-                                                        onMouseDown={(e) => handleMouseDownOnHandle(e, 'contact', contact.id, 'start')} />
-                                                    <div className="absolute right-0 top-0 bottom-0 w-3 -mr-1.5 cursor-ew-resize hover:bg-white/30 z-20"
-                                                        onMouseDown={(e) => handleMouseDownOnHandle(e, 'contact', contact.id, 'end')} />
+                                                    {anno.prompt && (
+                                                        <span className="flex h-full w-full items-center justify-center overflow-hidden px-1 py-1 text-center text-[10px] leading-tight text-white shadow-black drop-shadow-md pointer-events-none whitespace-normal break-words">
+                                                            {anno.prompt}
+                                                        </span>
+                                                    )}
                                                 </div>
                                             );
                                         })}
