@@ -53,6 +53,387 @@ const formatTime = (ms: number): string => {
     return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}`;
 };
 
+const sleep = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
+const nextAnimationFrame = () => new Promise<void>(resolve => window.requestAnimationFrame(() => resolve()));
+
+const sanitizeFilePart = (value: string): string =>
+    value
+        .replace(/^\//, '')
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '') || 'topic';
+
+const loadImageElement = (src: string): Promise<HTMLImageElement> =>
+    new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error(`Failed to load image: ${src}`));
+        img.src = src;
+    });
+
+const getSupportedMp4MimeType = (): string | null => {
+    const candidates = [
+        'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+        'video/mp4;codecs=avc1',
+        'video/mp4'
+    ];
+    return candidates.find(type => MediaRecorder.isTypeSupported(type)) || null;
+};
+
+type Mp4Sample = {
+    data: Uint8Array;
+    duration: number;
+    isKey: boolean;
+};
+
+const textBytes = (value: string): Uint8Array => new TextEncoder().encode(value);
+
+const be16 = (value: number): Uint8Array => Uint8Array.from([(value >>> 8) & 0xff, value & 0xff]);
+
+const be32 = (value: number): Uint8Array => Uint8Array.from([
+    (value >>> 24) & 0xff,
+    (value >>> 16) & 0xff,
+    (value >>> 8) & 0xff,
+    value & 0xff
+]);
+
+const concatBytes = (...parts: Uint8Array[]): Uint8Array => {
+    const total = parts.reduce((sum, part) => sum + part.length, 0);
+    const result = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+        result.set(part, offset);
+        offset += part.length;
+    }
+    return result;
+};
+
+const cloneBufferSource = (source: AllowSharedBufferSource): Uint8Array => {
+    const view = ArrayBuffer.isView(source)
+        ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
+        : new Uint8Array(source as ArrayBufferLike);
+    const clone = new Uint8Array(view.byteLength);
+    clone.set(view);
+    return clone;
+};
+
+const box = (type: string, ...payload: Uint8Array[]): Uint8Array => {
+    const size = 8 + payload.reduce((sum, part) => sum + part.length, 0);
+    return concatBytes(be32(size), textBytes(type), ...payload);
+};
+
+const fullBox = (type: string, version: number, flags: number, ...payload: Uint8Array[]): Uint8Array => {
+    const header = Uint8Array.from([
+        version & 0xff,
+        (flags >>> 16) & 0xff,
+        (flags >>> 8) & 0xff,
+        flags & 0xff
+    ]);
+    return box(type, header, ...payload);
+};
+
+const createFixed16_16 = (value: number): Uint8Array => be32(Math.round(value * 65536));
+
+const createFixed8_8 = (value: number): Uint8Array => be16(Math.round(value * 256));
+
+const createMatrix = (): Uint8Array => concatBytes(
+    be32(0x00010000), be32(0), be32(0),
+    be32(0), be32(0x00010000), be32(0),
+    be32(0), be32(0), be32(0x40000000)
+);
+
+const buildMp4FromAvcSamples = ({
+    samples,
+    width,
+    height,
+    timescale,
+    avcc
+}: {
+    samples: Mp4Sample[];
+    width: number;
+    height: number;
+    timescale: number;
+    avcc: Uint8Array;
+}): Uint8Array => {
+    const trackId = 1;
+    const duration = samples.reduce((sum, sample) => sum + sample.duration, 0);
+    const sampleSizes = samples.map(sample => sample.data.length);
+    const sampleCount = samples.length;
+    const chunkOffsets = [0];
+    const syncSamples = samples
+        .map((sample, index) => sample.isKey ? index + 1 : 0)
+        .filter(Boolean);
+    const mdatPayload = concatBytes(...samples.map(sample => sample.data));
+    const mdat = box('mdat', mdatPayload);
+
+    const stsd = fullBox(
+        'stsd',
+        0,
+        0,
+        be32(1),
+        box(
+            'avc1',
+            new Uint8Array(6),
+            be16(1),
+            new Uint8Array(16),
+            be16(width),
+            be16(height),
+            createFixed16_16(72),
+            createFixed16_16(72),
+            be32(0),
+            be16(1),
+            concatBytes(Uint8Array.from([0]), new Uint8Array(31)),
+            be16(24),
+            be16(0xffff),
+            box('avcC', avcc),
+            box('pasp', be32(1), be32(1))
+        )
+    );
+
+    const stts = fullBox('stts', 0, 0, be32(1), be32(sampleCount), be32(samples[0]?.duration ?? 0));
+    const stsc = fullBox('stsc', 0, 0, be32(1), be32(1), be32(1), be32(1));
+    const stsz = fullBox(
+        'stsz',
+        0,
+        0,
+        be32(0),
+        be32(sampleCount),
+        ...sampleSizes.map(size => be32(size))
+    );
+    const stco = fullBox('stco', 0, 0, be32(1), be32(0));
+    const stss = syncSamples.length > 0
+        ? fullBox('stss', 0, 0, be32(syncSamples.length), ...syncSamples.map(index => be32(index)))
+        : new Uint8Array();
+
+    const stbl = box('stbl', stsd, stts, stsc, stsz, stco, stss);
+    const dinf = box('dinf', fullBox('dref', 0, 0, be32(1), fullBox('url ', 0, 1)));
+    const vmhd = fullBox('vmhd', 0, 1, be16(0), be16(0), be16(0), be16(0));
+    const minf = box('minf', vmhd, dinf, stbl);
+    const mdhd = fullBox('mdhd', 0, 0, be32(0), be32(0), be32(timescale), be32(duration), be16(0x55c4), be16(0));
+    const hdlr = fullBox(
+        'hdlr',
+        0,
+        0,
+        be32(0),
+        textBytes('vide'),
+        be32(0),
+        be32(0),
+        be32(0),
+        concatBytes(textBytes('VideoHandler'), Uint8Array.from([0]))
+    );
+    const mdia = box('mdia', mdhd, hdlr, minf);
+    const tkhd = fullBox(
+        'tkhd',
+        0,
+        0x000007,
+        be32(0),
+        be32(0),
+        be32(trackId),
+        be32(0),
+        be32(duration),
+        be32(0),
+        be32(0),
+        be16(0),
+        be16(0),
+        be16(0),
+        be16(0),
+        createMatrix(),
+        createFixed16_16(width),
+        createFixed16_16(height)
+    );
+    const trex = fullBox('trex', 0, 0, be32(trackId), be32(1), be32(0), be32(0), be32(0));
+    const mvex = box('mvex', trex);
+    const trak = box('trak', tkhd, mdia);
+    const mvhd = fullBox(
+        'mvhd',
+        0,
+        0,
+        be32(0),
+        be32(0),
+        be32(timescale),
+        be32(duration),
+        createFixed16_16(1),
+        createFixed8_8(1),
+        be16(0),
+        be16(0),
+        be32(0),
+        be32(0),
+        createMatrix(),
+        new Uint8Array(24),
+        be32(2)
+    );
+
+    let moov = box('moov', mvhd, trak, mvex);
+    const ftyp = box(
+        'ftyp',
+        textBytes('isom'),
+        be32(0x00000200),
+        textBytes('isom'),
+        textBytes('iso2'),
+        textBytes('avc1'),
+        textBytes('mp41')
+    );
+
+    const stcoOffset = ftyp.length + moov.length + 8;
+    chunkOffsets[0] = stcoOffset;
+
+    const patchedStco = fullBox('stco', 0, 0, be32(1), be32(chunkOffsets[0]));
+    const patchedStbl = box('stbl', stsd, stts, stsc, stsz, patchedStco, stss);
+    const patchedMinf = box('minf', vmhd, dinf, patchedStbl);
+    const patchedMdia = box('mdia', mdhd, hdlr, patchedMinf);
+    const patchedTrak = box('trak', tkhd, patchedMdia);
+    moov = box('moov', mvhd, patchedTrak, mvex);
+
+    return concatBytes(ftyp, moov, mdat);
+};
+
+const getWebCodecsAvcConfig = async (width: number, height: number, fps: number): Promise<VideoEncoderConfig | null> => {
+    if (typeof VideoEncoder === 'undefined') {
+        return null;
+    }
+
+    const configs: VideoEncoderConfig[] = [
+        {
+            codec: 'avc1.42E01E',
+            width,
+            height,
+            bitrate: 4_000_000,
+            bitrateMode: 'variable',
+            framerate: fps,
+            avc: { format: 'avc' }
+        },
+        {
+            codec: 'avc1.42001E',
+            width,
+            height,
+            bitrate: 4_000_000,
+            bitrateMode: 'variable',
+            framerate: fps,
+            avc: { format: 'avc' }
+        }
+    ];
+
+    for (const config of configs) {
+        try {
+            const support = await VideoEncoder.isConfigSupported(config);
+            if (support.supported) {
+                return support.config ?? config;
+            }
+        } catch {
+            // Try the next candidate.
+        }
+    }
+
+    return null;
+};
+
+const encodeCanvasFramesToMp4 = async ({
+    width,
+    height,
+    fps,
+    renderFrame,
+    onProgress
+}: {
+    width: number;
+    height: number;
+    fps: number;
+    renderFrame: (frameIndex: number, canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) => Promise<void>;
+    onProgress?: (frameIndex: number) => void;
+}): Promise<Blob | null> => {
+    const config = await getWebCodecsAvcConfig(width, height, fps);
+    if (!config) {
+        return null;
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+        throw new Error('Unable to create canvas context.');
+    }
+
+    const timescale = fps * 1000;
+    const frameDuration = Math.round(timescale / fps);
+    const samples: Mp4Sample[] = [];
+    let avcc: Uint8Array | null = null;
+
+    const encoder = new VideoEncoder({
+        output: (chunk, metadata) => {
+            if (!avcc && metadata?.decoderConfig?.description) {
+                avcc = cloneBufferSource(metadata.decoderConfig.description);
+            }
+            const data = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(data);
+            samples.push({
+                data,
+                duration: frameDuration,
+                isKey: chunk.type === 'key'
+            });
+        },
+        error: (error) => {
+            throw error;
+        }
+    });
+
+    encoder.configure(config);
+
+    let frameIndex = 0;
+    try {
+        while (true) {
+            await renderFrame(frameIndex, canvas, ctx);
+            onProgress?.(frameIndex);
+            const frame = new VideoFrame(canvas, {
+                timestamp: Math.round((frameIndex * 1_000_000) / fps),
+                duration: Math.round(1_000_000 / fps)
+            });
+            encoder.encode(frame, { keyFrame: frameIndex % fps === 0 });
+            frame.close();
+            frameIndex += 1;
+
+            if (encoder.encodeQueueSize > fps * 2) {
+                await encoder.flush();
+            }
+        }
+    } catch (err: any) {
+        if (err?.message !== '__END_OF_EXPORT__') {
+            encoder.close();
+            throw err;
+        }
+    }
+
+    await encoder.flush();
+    encoder.close();
+
+    if (!avcc || samples.length === 0) {
+        return null;
+    }
+
+    const mp4Bytes = buildMp4FromAvcSamples({
+        samples,
+        width,
+        height,
+        timescale,
+        avcc
+    });
+
+    const blobBytes = new Uint8Array(mp4Bytes.byteLength);
+    blobBytes.set(mp4Bytes);
+    return new Blob([blobBytes.buffer], { type: 'video/mp4' });
+};
+
+const downloadBlob = (blob: Blob, fileName: string) => {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
 // --- Main Component ---
 const AnnotationPage: React.FC = () => {
     // --- Services ---
@@ -70,6 +451,8 @@ const AnnotationPage: React.FC = () => {
     const [isLoadingBag, setIsLoadingBag] = useState(false);
     const [loadingMessage, setLoadingMessage] = useState('');
     const [isDragOver, setIsDragOver] = useState(false);
+    const [isExportingVideos, setIsExportingVideos] = useState(false);
+    const [videoExportMessage, setVideoExportMessage] = useState('');
 
     // --- State: Playback ---
     const [currentFrameIndex, setCurrentFrameIndex] = useState(0);
@@ -99,6 +482,7 @@ const AnnotationPage: React.FC = () => {
     const playbackInterval = useRef<number | null>(null);
     const timelineInnerRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const urdfContainerRef = useRef<HTMLDivElement>(null);
 
     // 1. File Handling
     const loadBagFile = async (file: File) => {
@@ -310,6 +694,265 @@ const AnnotationPage: React.FC = () => {
         link.click();
         document.body.removeChild(link);
     };
+
+    const setExportStatus = useCallback((message: string) => {
+        setVideoExportMessage(message);
+    }, []);
+
+    const exportTopicVideoWithMediaRecorder = useCallback(async (topic: string, exportFileName: string) => {
+        if (timestamps.length === 0) {
+            throw new Error('No frames available to export.');
+        }
+
+        const firstFrame = await bagService.getFrameAt(0);
+        const firstImageSrc = firstFrame?.images[topic] || PLACEHOLDER_IMG;
+        const firstImage = await loadImageElement(firstImageSrc);
+
+        const canvas = document.createElement('canvas');
+        canvas.width = firstImage.naturalWidth || 640;
+        canvas.height = firstImage.naturalHeight || 480;
+
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+            throw new Error('Unable to create canvas context.');
+        }
+
+        const fps = 30;
+        const mimeType = getSupportedMp4MimeType();
+        if (!mimeType) {
+            throw new Error('Current browser does not support MP4 export via MediaRecorder.');
+        }
+        const stream = canvas.captureStream(fps);
+        const chunks: BlobPart[] = [];
+
+        const recorder = new MediaRecorder(stream, { mimeType });
+        recorder.ondataavailable = (event) => {
+            if (event.data.size > 0) chunks.push(event.data);
+        };
+
+        const stopped = new Promise<Blob>((resolve, reject) => {
+            recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+            recorder.onerror = () => reject(new Error(`Failed to export video for ${topic}`));
+        });
+
+        recorder.start();
+
+        for (let frameIndex = 0; frameIndex < timestamps.length; frameIndex++) {
+            const frame = await bagService.getFrameAt(frameIndex);
+            const src = frame?.images[topic] || PLACEHOLDER_IMG;
+            const image = await loadImageElement(src);
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+            await sleep(1000 / fps);
+        }
+
+        recorder.stop();
+        stream.getTracks().forEach(track => track.stop());
+
+        const blob = await stopped;
+        downloadBlob(blob, exportFileName);
+    }, [bagService, timestamps]);
+
+    const exportTopicVideo = useCallback(async (topic: string, exportFileName: string) => {
+        if (timestamps.length === 0) {
+            throw new Error('No frames available to export.');
+        }
+
+        const firstFrame = await bagService.getFrameAt(0);
+        const firstImageSrc = firstFrame?.images[topic] || PLACEHOLDER_IMG;
+        const firstImage = await loadImageElement(firstImageSrc);
+        const fps = 30;
+
+        const blob = await encodeCanvasFramesToMp4({
+            width: firstImage.naturalWidth || 640,
+            height: firstImage.naturalHeight || 480,
+            fps,
+            renderFrame: async (frameIndex, canvas, ctx) => {
+                if (frameIndex >= timestamps.length) {
+                    throw new Error('__END_OF_EXPORT__');
+                }
+
+                const frame = await bagService.getFrameAt(frameIndex);
+                const src = frame?.images[topic] || PLACEHOLDER_IMG;
+                const image = await loadImageElement(src);
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+            }
+        });
+
+        if (blob) {
+            downloadBlob(blob, exportFileName);
+            return;
+        }
+
+        await exportTopicVideoWithMediaRecorder(topic, exportFileName);
+    }, [bagService, exportTopicVideoWithMediaRecorder, timestamps.length]);
+
+    const handleExportSingleTopicVideo = useCallback(async (topic: string) => {
+        if (timestamps.length === 0 || isExportingVideos) {
+            return;
+        }
+
+        setIsExportingVideos(true);
+
+        try {
+            const baseName = sanitizeFilePart(fileName.replace(/\.bag$/i, '')) || 'rosbag';
+            setExportStatus(`Exporting topic video: ${topic}`);
+            await exportTopicVideo(topic, `${baseName}_${sanitizeFilePart(topic)}.mp4`);
+            setExportStatus(`Exported topic video: ${topic}`);
+            window.setTimeout(() => setVideoExportMessage(''), 2500);
+        } catch (err: any) {
+            console.error(err);
+            alert(`Error exporting topic video: ${err.message}`);
+            setVideoExportMessage('');
+        } finally {
+            setIsExportingVideos(false);
+        }
+    }, [exportTopicVideo, fileName, isExportingVideos, setExportStatus, timestamps.length]);
+
+    const handleExportUrdfVideo = useCallback(async () => {
+        if (timestamps.length === 0 || isExportingVideos) {
+            return;
+        }
+
+        const sourceCanvas = urdfContainerRef.current?.querySelector('canvas');
+        if (!(sourceCanvas instanceof HTMLCanvasElement)) {
+            alert('URDF canvas is not ready yet.');
+            return;
+        }
+
+        const exportCanvas = document.createElement('canvas');
+        exportCanvas.width = sourceCanvas.width || sourceCanvas.clientWidth || 1280;
+        exportCanvas.height = sourceCanvas.height || sourceCanvas.clientHeight || 720;
+
+        const ctx = exportCanvas.getContext('2d');
+        if (!ctx) {
+            alert('Unable to create canvas context for URDF export.');
+            return;
+        }
+
+        const previousIndex = currentFrameIndex;
+        const previousPlaying = isPlaying;
+        const fps = 30;
+
+        setIsPlaying(false);
+        setIsExportingVideos(true);
+
+        try {
+            const blob = await encodeCanvasFramesToMp4({
+                width: exportCanvas.width,
+                height: exportCanvas.height,
+                fps,
+                onProgress: (frameIndex) => {
+                    setExportStatus(`Exporting URDF video: ${Math.min(frameIndex + 1, timestamps.length)}/${timestamps.length}`);
+                },
+                renderFrame: async (frameIndex, canvas, renderCtx) => {
+                    if (frameIndex >= timestamps.length) {
+                        throw new Error('__END_OF_EXPORT__');
+                    }
+
+                    const frame = await bagService.getFrameAt(frameIndex);
+                    setCurrentFrameIndex(frameIndex);
+                    if (frame) {
+                        setDisplayedFrame(frame);
+                    }
+
+                    // Give React + three a chance to commit and paint the new pose.
+                    await nextAnimationFrame();
+                    await nextAnimationFrame();
+
+                    renderCtx.clearRect(0, 0, canvas.width, canvas.height);
+                    renderCtx.drawImage(sourceCanvas, 0, 0, canvas.width, canvas.height);
+                }
+            });
+
+            if (blob) {
+                downloadBlob(blob, `${sanitizeFilePart(fileName.replace(/\.bag$/i, '')) || 'rosbag'}_urdf.mp4`);
+            } else {
+                const mimeType = getSupportedMp4MimeType();
+                if (!mimeType) {
+                    throw new Error('Current browser does not support MP4 export.');
+                }
+
+                const stream = exportCanvas.captureStream(fps);
+                const chunks: BlobPart[] = [];
+                const recorder = new MediaRecorder(stream, { mimeType });
+                recorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) chunks.push(event.data);
+                };
+
+                const stopped = new Promise<Blob>((resolve, reject) => {
+                    recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+                    recorder.onerror = () => reject(new Error('Failed to export URDF video.'));
+                });
+
+                recorder.start();
+
+                for (let frameIndex = 0; frameIndex < timestamps.length; frameIndex++) {
+                    setExportStatus(`Exporting URDF video: ${frameIndex + 1}/${timestamps.length}`);
+                    const frame = await bagService.getFrameAt(frameIndex);
+                    setCurrentFrameIndex(frameIndex);
+                    if (frame) {
+                        setDisplayedFrame(frame);
+                    }
+                    await nextAnimationFrame();
+                    await nextAnimationFrame();
+                    ctx.clearRect(0, 0, exportCanvas.width, exportCanvas.height);
+                    ctx.drawImage(sourceCanvas, 0, 0, exportCanvas.width, exportCanvas.height);
+                    await sleep(1000 / fps);
+                }
+
+                recorder.stop();
+                stream.getTracks().forEach(track => track.stop());
+                const recordedBlob = await stopped;
+                downloadBlob(recordedBlob, `${sanitizeFilePart(fileName.replace(/\.bag$/i, '')) || 'rosbag'}_urdf.mp4`);
+            }
+
+            setExportStatus('Exported URDF video');
+            window.setTimeout(() => setVideoExportMessage(''), 2500);
+        } catch (err: any) {
+            console.error(err);
+            alert(`Error exporting URDF video: ${err.message}`);
+            setVideoExportMessage('');
+        } finally {
+            const restoreFrame = await bagService.getFrameAt(previousIndex);
+            setCurrentFrameIndex(previousIndex);
+            if (restoreFrame) {
+                setDisplayedFrame(restoreFrame);
+            }
+            setIsPlaying(previousPlaying);
+            setIsExportingVideos(false);
+        }
+    }, [bagService, currentFrameIndex, fileName, isExportingVideos, isPlaying, setExportStatus, timestamps.length]);
+
+    const handleExportAllVideos = useCallback(async () => {
+        if (orderedImageTopics.length === 0 || timestamps.length === 0 || isExportingVideos) {
+            return;
+        }
+
+        setIsExportingVideos(true);
+
+        try {
+            const baseName = sanitizeFilePart(fileName.replace(/\.bag$/i, '')) || 'rosbag';
+
+            for (let i = 0; i < orderedImageTopics.length; i++) {
+                const topic = orderedImageTopics[i];
+                setExportStatus(`Exporting ${i + 1}/${orderedImageTopics.length}: ${topic}`);
+                const topicName = sanitizeFilePart(topic);
+                await exportTopicVideo(topic, `${baseName}_${topicName}.mp4`);
+                await sleep(200);
+            }
+
+            setExportStatus(`Exported ${orderedImageTopics.length} videos`);
+            window.setTimeout(() => setVideoExportMessage(''), 2500);
+        } catch (err: any) {
+            console.error(err);
+            alert(`Error exporting videos: ${err.message}`);
+            setVideoExportMessage('');
+        } finally {
+            setIsExportingVideos(false);
+        }
+    }, [exportTopicVideo, fileName, isExportingVideos, orderedImageTopics, setExportStatus, timestamps.length]);
 
     // 2. Playback System
     const fetchFrame = useCallback(async (idx: number) => {
@@ -610,6 +1253,28 @@ const AnnotationPage: React.FC = () => {
                         Config
                     </button>
                     {isFileLoaded && (
+                        <button
+                            onClick={handleExportUrdfVideo}
+                            disabled={isExportingVideos || timestamps.length === 0}
+                            className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:bg-gray-900 disabled:text-gray-600 text-amber-300 text-xs font-bold uppercase tracking-wider rounded border border-gray-700 transition-all hover:border-amber-500/50 hover:shadow-[0_0_15px_rgba(245,158,11,0.1)] disabled:hover:border-gray-700 disabled:hover:shadow-none"
+                            title="Export URDF view as MP4"
+                        >
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14m-6 4h6a2 2 0 002-2V8a2 2 0 00-2-2H9a2 2 0 00-2 2v8a2 2 0 002 2zM3 8h4m-4 4h4m-4 4h4" /></svg>
+                            Export URDF Video
+                        </button>
+                    )}
+                    {isFileLoaded && (
+                        <button
+                            onClick={handleExportAllVideos}
+                            disabled={isExportingVideos || orderedImageTopics.length === 0}
+                            className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:bg-gray-900 disabled:text-gray-600 text-emerald-400 text-xs font-bold uppercase tracking-wider rounded border border-gray-700 transition-all hover:border-emerald-500/50 hover:shadow-[0_0_15px_rgba(16,185,129,0.1)] disabled:hover:border-gray-700 disabled:hover:shadow-none"
+                            title={orderedImageTopics.length === 0 ? 'No image topics available' : 'Export one video per topic'}
+                        >
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 4v16m0 0l-3-3m3 3l3-3M17 20V4m0 0l-3 3m3-3l3 3M10 8h4M10 16h4" /></svg>
+                            {isExportingVideos ? 'Exporting Videos...' : 'Export All Videos'}
+                        </button>
+                    )}
+                    {isFileLoaded && (
                         <button onClick={handleExportJSON} className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-cyan-400 text-xs font-bold uppercase tracking-wider rounded border border-gray-700 transition-all hover:border-cyan-500/50 hover:shadow-[0_0_15px_rgba(6,182,212,0.1)]">
                             <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
                             Export JSON
@@ -633,6 +1298,11 @@ const AnnotationPage: React.FC = () => {
                     <div className="flex-1 flex overflow-hidden">
                         {/* Visualizer Area */}
                         <div className="flex-1 flex flex-col border-r border-gray-800 min-w-0">
+                            {videoExportMessage && (
+                                <div className="border-b border-emerald-900/40 bg-emerald-950/30 px-4 py-2 text-[11px] text-emerald-300">
+                                    {videoExportMessage}
+                                </div>
+                            )}
                             <div className="flex-grow bg-[#020202] p-2 grid grid-cols-3 gap-2 overflow-y-auto content-start custom-scrollbar auto-rows-max">
                                 {visibleOrderedImageTopics.map((topic) => (
                                     <div key={topic} draggable onDragStart={(e) => handleImageDragStart(e, topic)} onDrop={(e) => handleImageDrop(e, topic)} onDragOver={(e) => e.preventDefault()}
@@ -658,6 +1328,7 @@ const AnnotationPage: React.FC = () => {
                                     <UrdfViewer
                                         jointData={displayedFrame?.jointStateMap || null}
                                         config={urdfConfig}
+                                        containerRef={urdfContainerRef}
                                     />
                                 </div>
                                 <div className="w-[67%] flex flex-col p-3 min-w-0">
@@ -771,20 +1442,32 @@ const AnnotationPage: React.FC = () => {
                                         {orderedImageTopics.map(topic => {
                                             const isVisible = visibleImageTopics.includes(topic);
                                             return (
-                                                <button
+                                                <div
                                                     key={topic}
-                                                    onClick={() => toggleImageTopicVisibility(topic)}
-                                                    className={`max-w-full rounded border px-2 py-1 text-[10px] transition-colors ${
+                                                    className={`flex max-w-full items-center gap-1 rounded border px-2 py-1 text-[10px] transition-colors ${
                                                         isVisible
                                                             ? 'border-cyan-500/50 bg-cyan-900/30 text-cyan-300'
                                                             : 'border-gray-700 bg-gray-900 text-gray-500 hover:border-gray-500 hover:text-gray-300'
                                                     }`}
                                                     title={topic}
                                                 >
-                                                    <span className="block max-w-[220px] truncate">
-                                                        {topicMetadata?.[topic]?.title || topic}
-                                                    </span>
-                                                </button>
+                                                    <button
+                                                        onClick={() => toggleImageTopicVisibility(topic)}
+                                                        className="min-w-0 flex-1 text-left"
+                                                    >
+                                                        <span className="block max-w-[180px] truncate">
+                                                            {topicMetadata?.[topic]?.title || topic}
+                                                        </span>
+                                                    </button>
+                                                    <button
+                                                        onClick={() => handleExportSingleTopicVideo(topic)}
+                                                        disabled={isExportingVideos}
+                                                        className="shrink-0 rounded border border-gray-700 px-1.5 py-0.5 text-[9px] font-bold text-emerald-300 transition-colors hover:border-emerald-500/50 hover:text-emerald-200 disabled:text-gray-600"
+                                                        title={`Export ${topic} as MP4`}
+                                                    >
+                                                        MP4
+                                                    </button>
+                                                </div>
                                             );
                                         })}
                                     </div>

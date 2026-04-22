@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo, type RefObject } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
 import { OrbitControls, Grid } from '@react-three/drei';
 import * as THREE from 'three';
@@ -62,9 +62,10 @@ function URDFModel({ path, modelRef, onReady }: URDFModelProps) {
 interface UrdfViewerProps {
     jointData: Record<string, JointStateMsg> | null;
     config: UrdfConfig;
+    containerRef?: RefObject<HTMLDivElement | null>;
 }
 
-const UrdfViewer = ({ jointData, config }: UrdfViewerProps) => {
+const UrdfViewer = ({ jointData, config, containerRef }: UrdfViewerProps) => {
     const modelRef = useRef<URDFRobot | null>(null);
     const [isModelReady, setIsModelReady] = useState(false);
 
@@ -104,7 +105,7 @@ const UrdfViewer = ({ jointData, config }: UrdfViewerProps) => {
     }, [jointData, isModelReady, processJoints]);
 
     return (
-        <div id="urdfContainer" className="w-full h-full rounded-lg shadow-inner bg-gradient-to-b from-gray-900 to-black overflow-hidden relative">
+        <div ref={containerRef} id="urdfContainer" className="w-full h-full rounded-lg shadow-inner bg-gradient-to-b from-gray-900 to-black overflow-hidden relative">
             <Canvas shadows camera={{ position: [1, 1, 1], fov: 45 }}>
                 <ambientLight intensity={0.5} />
                 <directionalLight position={[5, 10, 5]} castShadow intensity={1} />
