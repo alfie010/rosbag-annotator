@@ -80,349 +80,6 @@ const getSupportedMp4MimeType = (): string | null => {
     return candidates.find(type => MediaRecorder.isTypeSupported(type)) || null;
 };
 
-type Mp4Sample = {
-    data: Uint8Array;
-    duration: number;
-    isKey: boolean;
-};
-
-const textBytes = (value: string): Uint8Array => new TextEncoder().encode(value);
-
-const be16 = (value: number): Uint8Array => Uint8Array.from([(value >>> 8) & 0xff, value & 0xff]);
-
-const be32 = (value: number): Uint8Array => Uint8Array.from([
-    (value >>> 24) & 0xff,
-    (value >>> 16) & 0xff,
-    (value >>> 8) & 0xff,
-    value & 0xff
-]);
-
-const concatBytes = (...parts: Uint8Array[]): Uint8Array => {
-    const total = parts.reduce((sum, part) => sum + part.length, 0);
-    const result = new Uint8Array(total);
-    let offset = 0;
-    for (const part of parts) {
-        result.set(part, offset);
-        offset += part.length;
-    }
-    return result;
-};
-
-const cloneBufferSource = (source: AllowSharedBufferSource): Uint8Array => {
-    const view = ArrayBuffer.isView(source)
-        ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
-        : new Uint8Array(source as ArrayBufferLike);
-    const clone = new Uint8Array(view.byteLength);
-    clone.set(view);
-    return clone;
-};
-
-const box = (type: string, ...payload: Uint8Array[]): Uint8Array => {
-    const size = 8 + payload.reduce((sum, part) => sum + part.length, 0);
-    return concatBytes(be32(size), textBytes(type), ...payload);
-};
-
-const fullBox = (type: string, version: number, flags: number, ...payload: Uint8Array[]): Uint8Array => {
-    const header = Uint8Array.from([
-        version & 0xff,
-        (flags >>> 16) & 0xff,
-        (flags >>> 8) & 0xff,
-        flags & 0xff
-    ]);
-    return box(type, header, ...payload);
-};
-
-const createFixed16_16 = (value: number): Uint8Array => be32(Math.round(value * 65536));
-
-const createFixed8_8 = (value: number): Uint8Array => be16(Math.round(value * 256));
-
-const createMatrix = (): Uint8Array => concatBytes(
-    be32(0x00010000), be32(0), be32(0),
-    be32(0), be32(0x00010000), be32(0),
-    be32(0), be32(0), be32(0x40000000)
-);
-
-const buildMp4FromAvcSamples = ({
-    samples,
-    width,
-    height,
-    timescale,
-    avcc
-}: {
-    samples: Mp4Sample[];
-    width: number;
-    height: number;
-    timescale: number;
-    avcc: Uint8Array;
-}): Uint8Array => {
-    const trackId = 1;
-    const duration = samples.reduce((sum, sample) => sum + sample.duration, 0);
-    const sampleSizes = samples.map(sample => sample.data.length);
-    const sampleCount = samples.length;
-    const chunkOffsets = [0];
-    const syncSamples = samples
-        .map((sample, index) => sample.isKey ? index + 1 : 0)
-        .filter(Boolean);
-    const mdatPayload = concatBytes(...samples.map(sample => sample.data));
-    const mdat = box('mdat', mdatPayload);
-
-    const stsd = fullBox(
-        'stsd',
-        0,
-        0,
-        be32(1),
-        box(
-            'avc1',
-            new Uint8Array(6),
-            be16(1),
-            new Uint8Array(16),
-            be16(width),
-            be16(height),
-            createFixed16_16(72),
-            createFixed16_16(72),
-            be32(0),
-            be16(1),
-            concatBytes(Uint8Array.from([0]), new Uint8Array(31)),
-            be16(24),
-            be16(0xffff),
-            box('avcC', avcc),
-            box('pasp', be32(1), be32(1))
-        )
-    );
-
-    const stts = fullBox('stts', 0, 0, be32(1), be32(sampleCount), be32(samples[0]?.duration ?? 0));
-    const stsc = fullBox('stsc', 0, 0, be32(1), be32(1), be32(1), be32(1));
-    const stsz = fullBox(
-        'stsz',
-        0,
-        0,
-        be32(0),
-        be32(sampleCount),
-        ...sampleSizes.map(size => be32(size))
-    );
-    const stco = fullBox('stco', 0, 0, be32(1), be32(0));
-    const stss = syncSamples.length > 0
-        ? fullBox('stss', 0, 0, be32(syncSamples.length), ...syncSamples.map(index => be32(index)))
-        : new Uint8Array();
-
-    const stbl = box('stbl', stsd, stts, stsc, stsz, stco, stss);
-    const dinf = box('dinf', fullBox('dref', 0, 0, be32(1), fullBox('url ', 0, 1)));
-    const vmhd = fullBox('vmhd', 0, 1, be16(0), be16(0), be16(0), be16(0));
-    const minf = box('minf', vmhd, dinf, stbl);
-    const mdhd = fullBox('mdhd', 0, 0, be32(0), be32(0), be32(timescale), be32(duration), be16(0x55c4), be16(0));
-    const hdlr = fullBox(
-        'hdlr',
-        0,
-        0,
-        be32(0),
-        textBytes('vide'),
-        be32(0),
-        be32(0),
-        be32(0),
-        concatBytes(textBytes('VideoHandler'), Uint8Array.from([0]))
-    );
-    const mdia = box('mdia', mdhd, hdlr, minf);
-    const tkhd = fullBox(
-        'tkhd',
-        0,
-        0x000007,
-        be32(0),
-        be32(0),
-        be32(trackId),
-        be32(0),
-        be32(duration),
-        be32(0),
-        be32(0),
-        be16(0),
-        be16(0),
-        be16(0),
-        be16(0),
-        createMatrix(),
-        createFixed16_16(width),
-        createFixed16_16(height)
-    );
-    const trex = fullBox('trex', 0, 0, be32(trackId), be32(1), be32(0), be32(0), be32(0));
-    const mvex = box('mvex', trex);
-    const trak = box('trak', tkhd, mdia);
-    const mvhd = fullBox(
-        'mvhd',
-        0,
-        0,
-        be32(0),
-        be32(0),
-        be32(timescale),
-        be32(duration),
-        createFixed16_16(1),
-        createFixed8_8(1),
-        be16(0),
-        be16(0),
-        be32(0),
-        be32(0),
-        createMatrix(),
-        new Uint8Array(24),
-        be32(2)
-    );
-
-    let moov = box('moov', mvhd, trak, mvex);
-    const ftyp = box(
-        'ftyp',
-        textBytes('isom'),
-        be32(0x00000200),
-        textBytes('isom'),
-        textBytes('iso2'),
-        textBytes('avc1'),
-        textBytes('mp41')
-    );
-
-    const stcoOffset = ftyp.length + moov.length + 8;
-    chunkOffsets[0] = stcoOffset;
-
-    const patchedStco = fullBox('stco', 0, 0, be32(1), be32(chunkOffsets[0]));
-    const patchedStbl = box('stbl', stsd, stts, stsc, stsz, patchedStco, stss);
-    const patchedMinf = box('minf', vmhd, dinf, patchedStbl);
-    const patchedMdia = box('mdia', mdhd, hdlr, patchedMinf);
-    const patchedTrak = box('trak', tkhd, patchedMdia);
-    moov = box('moov', mvhd, patchedTrak, mvex);
-
-    return concatBytes(ftyp, moov, mdat);
-};
-
-const getWebCodecsAvcConfig = async (width: number, height: number, fps: number): Promise<VideoEncoderConfig | null> => {
-    if (typeof VideoEncoder === 'undefined') {
-        return null;
-    }
-
-    const configs: VideoEncoderConfig[] = [
-        {
-            codec: 'avc1.42E01E',
-            width,
-            height,
-            bitrate: 4_000_000,
-            bitrateMode: 'variable',
-            framerate: fps,
-            avc: { format: 'avc' }
-        },
-        {
-            codec: 'avc1.42001E',
-            width,
-            height,
-            bitrate: 4_000_000,
-            bitrateMode: 'variable',
-            framerate: fps,
-            avc: { format: 'avc' }
-        }
-    ];
-
-    for (const config of configs) {
-        try {
-            const support = await VideoEncoder.isConfigSupported(config);
-            if (support.supported) {
-                return support.config ?? config;
-            }
-        } catch {
-            // Try the next candidate.
-        }
-    }
-
-    return null;
-};
-
-const encodeCanvasFramesToMp4 = async ({
-    width,
-    height,
-    fps,
-    renderFrame,
-    onProgress
-}: {
-    width: number;
-    height: number;
-    fps: number;
-    renderFrame: (frameIndex: number, canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) => Promise<void>;
-    onProgress?: (frameIndex: number) => void;
-}): Promise<Blob | null> => {
-    const config = await getWebCodecsAvcConfig(width, height, fps);
-    if (!config) {
-        return null;
-    }
-
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-        throw new Error('Unable to create canvas context.');
-    }
-
-    const timescale = fps * 1000;
-    const frameDuration = Math.round(timescale / fps);
-    const samples: Mp4Sample[] = [];
-    let avcc: Uint8Array | null = null;
-
-    const encoder = new VideoEncoder({
-        output: (chunk, metadata) => {
-            if (!avcc && metadata?.decoderConfig?.description) {
-                avcc = cloneBufferSource(metadata.decoderConfig.description);
-            }
-            const data = new Uint8Array(chunk.byteLength);
-            chunk.copyTo(data);
-            samples.push({
-                data,
-                duration: frameDuration,
-                isKey: chunk.type === 'key'
-            });
-        },
-        error: (error) => {
-            throw error;
-        }
-    });
-
-    encoder.configure(config);
-
-    let frameIndex = 0;
-    try {
-        while (true) {
-            await renderFrame(frameIndex, canvas, ctx);
-            onProgress?.(frameIndex);
-            const frame = new VideoFrame(canvas, {
-                timestamp: Math.round((frameIndex * 1_000_000) / fps),
-                duration: Math.round(1_000_000 / fps)
-            });
-            encoder.encode(frame, { keyFrame: frameIndex % fps === 0 });
-            frame.close();
-            frameIndex += 1;
-
-            if (encoder.encodeQueueSize > fps * 2) {
-                await encoder.flush();
-            }
-        }
-    } catch (err: any) {
-        if (err?.message !== '__END_OF_EXPORT__') {
-            encoder.close();
-            throw err;
-        }
-    }
-
-    await encoder.flush();
-    encoder.close();
-
-    if (!avcc || samples.length === 0) {
-        return null;
-    }
-
-    const mp4Bytes = buildMp4FromAvcSamples({
-        samples,
-        width,
-        height,
-        timescale,
-        avcc
-    });
-
-    const blobBytes = new Uint8Array(mp4Bytes.byteLength);
-    blobBytes.set(mp4Bytes);
-    return new Blob([blobBytes.buffer], { type: 'video/mp4' });
-};
-
 const downloadBlob = (blob: Blob, fileName: string) => {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -432,6 +89,14 @@ const downloadBlob = (blob: Blob, fileName: string) => {
     link.click();
     document.body.removeChild(link);
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+const getCanvasCaptureTrack = (stream: MediaStream): CanvasCaptureMediaStreamTrack => {
+    const [track] = stream.getVideoTracks();
+    if (!track || typeof (track as CanvasCaptureMediaStreamTrack).requestFrame !== 'function') {
+        throw new Error('Canvas capture track is not available.');
+    }
+    return track as CanvasCaptureMediaStreamTrack;
 };
 
 // --- Main Component ---
@@ -717,12 +382,12 @@ const AnnotationPage: React.FC = () => {
             throw new Error('Unable to create canvas context.');
         }
 
-        const fps = 30;
         const mimeType = getSupportedMp4MimeType();
         if (!mimeType) {
             throw new Error('Current browser does not support MP4 export via MediaRecorder.');
         }
-        const stream = canvas.captureStream(fps);
+        const stream = canvas.captureStream(0);
+        const captureTrack = getCanvasCaptureTrack(stream);
         const chunks: BlobPart[] = [];
 
         const recorder = new MediaRecorder(stream, { mimeType });
@@ -743,7 +408,8 @@ const AnnotationPage: React.FC = () => {
             const image = await loadImageElement(src);
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-            await sleep(1000 / fps);
+            captureTrack.requestFrame();
+            await nextAnimationFrame();
         }
 
         recorder.stop();
@@ -754,39 +420,8 @@ const AnnotationPage: React.FC = () => {
     }, [bagService, timestamps]);
 
     const exportTopicVideo = useCallback(async (topic: string, exportFileName: string) => {
-        if (timestamps.length === 0) {
-            throw new Error('No frames available to export.');
-        }
-
-        const firstFrame = await bagService.getFrameAt(0);
-        const firstImageSrc = firstFrame?.images[topic] || PLACEHOLDER_IMG;
-        const firstImage = await loadImageElement(firstImageSrc);
-        const fps = 30;
-
-        const blob = await encodeCanvasFramesToMp4({
-            width: firstImage.naturalWidth || 640,
-            height: firstImage.naturalHeight || 480,
-            fps,
-            renderFrame: async (frameIndex, canvas, ctx) => {
-                if (frameIndex >= timestamps.length) {
-                    throw new Error('__END_OF_EXPORT__');
-                }
-
-                const frame = await bagService.getFrameAt(frameIndex);
-                const src = frame?.images[topic] || PLACEHOLDER_IMG;
-                const image = await loadImageElement(src);
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-                ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-            }
-        });
-
-        if (blob) {
-            downloadBlob(blob, exportFileName);
-            return;
-        }
-
         await exportTopicVideoWithMediaRecorder(topic, exportFileName);
-    }, [bagService, exportTopicVideoWithMediaRecorder, timestamps.length]);
+    }, [exportTopicVideoWithMediaRecorder]);
 
     const handleExportSingleTopicVideo = useCallback(async (topic: string) => {
         if (timestamps.length === 0 || isExportingVideos) {
@@ -833,80 +468,49 @@ const AnnotationPage: React.FC = () => {
 
         const previousIndex = currentFrameIndex;
         const previousPlaying = isPlaying;
-        const fps = 30;
-
         setIsPlaying(false);
         setIsExportingVideos(true);
 
         try {
-            const blob = await encodeCanvasFramesToMp4({
-                width: exportCanvas.width,
-                height: exportCanvas.height,
-                fps,
-                onProgress: (frameIndex) => {
-                    setExportStatus(`Exporting URDF video: ${Math.min(frameIndex + 1, timestamps.length)}/${timestamps.length}`);
-                },
-                renderFrame: async (frameIndex, canvas, renderCtx) => {
-                    if (frameIndex >= timestamps.length) {
-                        throw new Error('__END_OF_EXPORT__');
-                    }
+            const mimeType = getSupportedMp4MimeType();
+            if (!mimeType) {
+                throw new Error('Current browser does not support MP4 export.');
+            }
 
-                    const frame = await bagService.getFrameAt(frameIndex);
-                    setCurrentFrameIndex(frameIndex);
-                    if (frame) {
-                        setDisplayedFrame(frame);
-                    }
+            const stream = exportCanvas.captureStream(0);
+            const captureTrack = getCanvasCaptureTrack(stream);
+            const chunks: BlobPart[] = [];
+            const recorder = new MediaRecorder(stream, { mimeType });
+            recorder.ondataavailable = (event) => {
+                if (event.data.size > 0) chunks.push(event.data);
+            };
 
-                    // Give React + three a chance to commit and paint the new pose.
-                    await nextAnimationFrame();
-                    await nextAnimationFrame();
-
-                    renderCtx.clearRect(0, 0, canvas.width, canvas.height);
-                    renderCtx.drawImage(sourceCanvas, 0, 0, canvas.width, canvas.height);
-                }
+            const stopped = new Promise<Blob>((resolve, reject) => {
+                recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+                recorder.onerror = () => reject(new Error('Failed to export URDF video.'));
             });
 
-            if (blob) {
-                downloadBlob(blob, `${sanitizeFilePart(fileName.replace(/\.bag$/i, '')) || 'rosbag'}_urdf.mp4`);
-            } else {
-                const mimeType = getSupportedMp4MimeType();
-                if (!mimeType) {
-                    throw new Error('Current browser does not support MP4 export.');
+            recorder.start();
+
+            for (let frameIndex = 0; frameIndex < timestamps.length; frameIndex++) {
+                setExportStatus(`Exporting URDF video: ${frameIndex + 1}/${timestamps.length}`);
+                const frame = await bagService.getFrameAt(frameIndex);
+                setCurrentFrameIndex(frameIndex);
+                if (frame) {
+                    setDisplayedFrame(frame);
                 }
-
-                const stream = exportCanvas.captureStream(fps);
-                const chunks: BlobPart[] = [];
-                const recorder = new MediaRecorder(stream, { mimeType });
-                recorder.ondataavailable = (event) => {
-                    if (event.data.size > 0) chunks.push(event.data);
-                };
-
-                const stopped = new Promise<Blob>((resolve, reject) => {
-                    recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
-                    recorder.onerror = () => reject(new Error('Failed to export URDF video.'));
-                });
-
-                recorder.start();
-
-                for (let frameIndex = 0; frameIndex < timestamps.length; frameIndex++) {
-                    setExportStatus(`Exporting URDF video: ${frameIndex + 1}/${timestamps.length}`);
-                    const frame = await bagService.getFrameAt(frameIndex);
-                    setCurrentFrameIndex(frameIndex);
-                    if (frame) {
-                        setDisplayedFrame(frame);
-                    }
-                    await nextAnimationFrame();
-                    await nextAnimationFrame();
-                    ctx.clearRect(0, 0, exportCanvas.width, exportCanvas.height);
-                    ctx.drawImage(sourceCanvas, 0, 0, exportCanvas.width, exportCanvas.height);
-                    await sleep(1000 / fps);
-                }
-
-                recorder.stop();
-                stream.getTracks().forEach(track => track.stop());
-                const recordedBlob = await stopped;
-                downloadBlob(recordedBlob, `${sanitizeFilePart(fileName.replace(/\.bag$/i, '')) || 'rosbag'}_urdf.mp4`);
+                await nextAnimationFrame();
+                await nextAnimationFrame();
+                ctx.clearRect(0, 0, exportCanvas.width, exportCanvas.height);
+                ctx.drawImage(sourceCanvas, 0, 0, exportCanvas.width, exportCanvas.height);
+                captureTrack.requestFrame();
+                await nextAnimationFrame();
             }
+
+            recorder.stop();
+            stream.getTracks().forEach(track => track.stop());
+            const recordedBlob = await stopped;
+            downloadBlob(recordedBlob, `${sanitizeFilePart(fileName.replace(/\.bag$/i, '')) || 'rosbag'}_urdf.mp4`);
 
             setExportStatus('Exported URDF video');
             window.setTimeout(() => setVideoExportMessage(''), 2500);
