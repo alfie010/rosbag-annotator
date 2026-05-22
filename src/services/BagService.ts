@@ -392,6 +392,18 @@ export class BagService {
 
     private collectOverlaysForImage(imageTopic: string, overlaySnapshot: Record<string, any>): OverlayAnnotation[] {
         const overlays: OverlayAnnotation[] = [];
+        const imageToken = this.normalizeOverlayTopicToken(imageTopic);
+        const hasZeroConfidenceBbox = Object.entries(overlaySnapshot).some(([overlayTopic, rawMsg]) => {
+            if (!this.isOverlayRelevantToImage(overlayTopic, imageTopic)) return false;
+            if (!/bbox/i.test(overlayTopic)) return false;
+            const numericData = this.extractOverlayConfidence(rawMsg);
+            return numericData === 0;
+        });
+
+        if (hasZeroConfidenceBbox) {
+            overlayLog('skip overlays for zero-confidence bbox', { imageTopic, imageToken });
+            return [];
+        }
 
         for (const [overlayTopic, rawMsg] of Object.entries(overlaySnapshot)) {
             if (this.isOverlayRelevantToImage(overlayTopic, imageTopic)) {
@@ -504,13 +516,13 @@ export class BagService {
 
         if (this.isPointLike(topic, record)) {
             const point = this.extractPoint(record);
-            if (!point) return [];
+            if (!point || this.shouldSkipConfidence(point.confidence)) return [];
             return [{ kind: 'point', ...point, color: this.getTopicColor(topic) }];
         }
 
         if (this.isBoxLike(topic, record)) {
             const box = this.extractBbox(record);
-            if (!box) return [];
+            if (!box || this.shouldSkipConfidence(box.confidence)) return [];
             return [{ kind: 'bbox', ...box, color: this.getTopicColor(topic) }];
         }
 
@@ -539,6 +551,7 @@ export class BagService {
                 radius: radiusValue ?? 5,
                 label: `${topic.split('/').pop() || 'point'}`
             };
+            if (this.shouldSkipConfidence(undefined)) return [];
             overlayLog('parsed point array', { topic, values, point });
             return [{ kind: 'point', ...point, color: this.getTopicColor(topic) }];
         }
@@ -546,6 +559,7 @@ export class BagService {
         if (/bbox/i.test(topic)) {
             if (values.length >= 4) {
                 const [a, b, c, d, confidence] = values;
+                if (this.shouldSkipConfidence(confidence)) return [];
                 const useMinMax = c > a && d > b && (c - a > 0) && (d - b > 0);
                 const bbox = useMinMax
                     ? { x: a, y: b, width: c - a, height: d - b, confidence }
@@ -563,6 +577,7 @@ export class BagService {
 
         if (values.length >= 4) {
             const [x, y, width, height, confidence] = values;
+            if (this.shouldSkipConfidence(confidence)) return [];
             overlayLog('parsed generic numeric overlay as bbox', { topic, values });
             return [{ kind: 'bbox', x, y, width, height, confidence, color: this.getTopicColor(topic) }];
         }
@@ -661,6 +676,8 @@ export class BagService {
         const y = this.readNumber(payload.y) ?? this.readNumber(payload.v) ?? this.readNumber(payload.py) ?? this.readNumber(payload.cy) ?? this.readNumber(payload.center_y) ?? this.readNumber(nested?.y) ?? this.readNumber(nested?.v);
         if (x === null || y === null) return null;
 
+        if (this.shouldSkipConfidence(this.readNumber(payload.confidence) ?? this.readNumber(payload.score))) return null;
+
         return {
             x,
             y,
@@ -670,6 +687,32 @@ export class BagService {
         };
     }
 
+    private extractOverlayConfidence(rawMsg: any): number | null {
+        const payload = this.unwrapOverlayPayload(rawMsg);
+        if (payload == null) return null;
+
+        if (Array.isArray(payload)) {
+            if (payload.length >= 5 && typeof payload[4] === 'number') return payload[4];
+            return null;
+        }
+
+        if (typeof payload !== 'object') return null;
+
+        const record = payload as Record<string, any>;
+        const numericObjectData = this.readNumericSequenceFromObject(record);
+        if (numericObjectData.length >= 5) {
+            return numericObjectData[4];
+        }
+
+        const dataSequence = this.readNumericSequence(record.data);
+        if (dataSequence.length >= 5) {
+            return dataSequence[4];
+        }
+
+        const confidence = this.readNumber(record.confidence) ?? this.readNumber(record.score);
+        return confidence;
+    }
+
     private extractBbox(payload: Record<string, any>): Omit<OverlayAnnotation, 'kind' | 'color'> | null {
         const nested = payload.bbox || payload.box || payload.rect;
         const source = nested && typeof nested === 'object' ? nested : payload;
@@ -677,6 +720,8 @@ export class BagService {
         const x = this.readNumber(source.x) ?? this.readNumber(source.cx) ?? this.readNumber(source.center_x) ?? this.readNumber(source.xmin) ?? this.readNumber(source.left) ?? this.readNumber(source.x1);
         const y = this.readNumber(source.y) ?? this.readNumber(source.cy) ?? this.readNumber(source.center_y) ?? this.readNumber(source.ymin) ?? this.readNumber(source.top) ?? this.readNumber(source.y1);
         if (x === null || y === null) return null;
+
+        if (this.shouldSkipConfidence(this.readNumber(payload.confidence) ?? this.readNumber(payload.score))) return null;
 
         const width = this.readNumber(source.width) ?? this.readNumber(source.w) ?? (this.readNumber(source.xmax) !== null ? (this.readNumber(source.xmax)! - x) : null) ?? (this.readNumber(source.right) !== null ? (this.readNumber(source.right)! - x) : null) ?? (this.readNumber(source.x2) !== null ? (this.readNumber(source.x2)! - x) : null);
         const height = this.readNumber(source.height) ?? this.readNumber(source.h) ?? (this.readNumber(source.ymax) !== null ? (this.readNumber(source.ymax)! - y) : null) ?? (this.readNumber(source.bottom) !== null ? (this.readNumber(source.bottom)! - y) : null) ?? (this.readNumber(source.y2) !== null ? (this.readNumber(source.y2)! - y) : null);
@@ -696,6 +741,10 @@ export class BagService {
     private readLabel(payload: Record<string, any>): string | undefined {
         const value = payload.label ?? payload.name ?? payload.class ?? payload.text ?? payload.id;
         return typeof value === 'string' || typeof value === 'number' ? String(value) : undefined;
+    }
+
+    private shouldSkipConfidence(confidence: number | null | undefined): boolean {
+        return confidence === 0;
     }
 
     private readNumber(value: any): number | null {
