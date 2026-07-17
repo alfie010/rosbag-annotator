@@ -14,7 +14,7 @@ import {
 import annotationPlugin from 'chartjs-plugin-annotation';
 
 // --- Imports (Adjust paths as needed) ---
-import { BagService, type ParsedFrame, type JointStateMsg } from './services/BagService';
+import { BagService, type ParsedFrame, type ChartSeriesMsg } from './services/BagService';
 import UrdfViewer from './components/urdf/UrdfViewer';
 import { UrdfSettingsDialog, PIPER_CONFIG } from './components/dialogs/UrdfSettingsDialog';
 import type { UrdfConfig } from './components/urdf/UrdfViewer';
@@ -128,11 +128,11 @@ const AnnotationPage: React.FC = () => {
     const [orderedImageTopics, setOrderedImageTopics] = useState<string[]>([]);
     const [visibleImageTopics, setVisibleImageTopics] = useState<string[]>([]);
     const [draggedTopic, setDraggedTopic] = useState<string | null>(null);
-    const [historicalJointData, setHistoricalJointData] = useState<Map<number, Record<string, JointStateMsg>>>(new Map());
+    const [historicalPlotData, setHistoricalPlotData] = useState<Map<number, Record<string, ChartSeriesMsg>>>(new Map());
     const [availableJointNames, setAvailableJointNames] = useState<string[]>([]);
 
     // Joint Graph Settings
-    const [selectedJointDataType, setSelectedJointDataType] = useState<'position' | 'velocity' | 'effort'>('position');
+    const [selectedJointDataType, setSelectedJointDataType] = useState<'position' | 'velocity' | 'effort' | 'force' | 'torque'>('position');
     const [selectedJointsToChart, setSelectedJointsToChart] = useState<string[]>([]);
 
     // --- State: Annotation ---
@@ -166,8 +166,8 @@ const AnnotationPage: React.FC = () => {
             setTopicMetadata(bagService.topicMetadata);
 
             // 1. Get the raw data map
-            const history = bagService.historicalJointData;
-            setHistoricalJointData(history);
+            const history = bagService.historicalPlotData;
+            setHistoricalPlotData(history);
 
             // 2. Discover Joints Dynamically
             // Look at the first frame that has data
@@ -175,7 +175,7 @@ const AnnotationPage: React.FC = () => {
             const foundJoints: string[] = [];
 
             if (firstData) {
-                // Iterate over all topics in this frame (e.g., /joint_states)
+                // Iterate over all chartable topics in this frame.
                 Object.entries(firstData).forEach(([topic, msg]) => {
                     if (msg.name && Array.isArray(msg.name) && msg.name.length > 0) {
                         msg.name.forEach(name => {
@@ -753,11 +753,11 @@ const AnnotationPage: React.FC = () => {
 
     // --- Chart Data & Options ---
     const plotData = useMemo(() => {
-        if (historicalJointData.size === 0 || availableJointNames.length === 0) {
+        if (historicalPlotData.size === 0 || availableJointNames.length === 0) {
             return { labels: [], datasets: [] };
         }
 
-        const indices = Array.from(historicalJointData.keys()).sort((a, b) => a - b);
+        const indices = Array.from(historicalPlotData.keys()).sort((a, b) => a - b);
         const labels = indices.map(i => formatTime(timestamps[i] - timestamps[0]));
 
         const colors = [
@@ -769,16 +769,15 @@ const AnnotationPage: React.FC = () => {
         const datasets = selectedJointsToChart.map((uniqueId, i) => ({
             label: uniqueId,
             data: indices.map(idx => {
-                const frameData = historicalJointData.get(idx);
+                const frameData = historicalPlotData.get(idx);
                 if (!frameData) return null;
 
                 for (const topic of Object.keys(frameData)) {
                     const msg = frameData[topic];
-
                     const pos = msg.name.findIndex(rawName => `${topic}/${rawName}` === uniqueId);
-
-                    if (pos !== -1 && msg[selectedJointDataType]) {
-                        return msg[selectedJointDataType][pos];
+                    const series = msg[selectedJointDataType];
+                    if (pos !== -1 && series) {
+                        return series[pos] ?? null;
                     }
                 }
                 return null;
@@ -791,7 +790,7 @@ const AnnotationPage: React.FC = () => {
         }));
 
         return { labels, datasets };
-    }, [historicalJointData, selectedJointsToChart, selectedJointDataType, timestamps]);
+    }, [historicalPlotData, selectedJointsToChart, selectedJointDataType, timestamps]);
 
     const plotOptions = useMemo<ChartOptions<'line'>>(() => {
         return {
@@ -1006,9 +1005,9 @@ const AnnotationPage: React.FC = () => {
                                             </div>
                                         </div>
 
-                                        {/* Data Type Selector (Pos/Vel/Eff) */}
+                                        {/* Data Type Selector */}
                                         <div className="flex bg-gray-900 rounded-lg border border-gray-800 p-0.5">
-                                            {['position', 'velocity', 'effort'].map(t => (
+                                            {['position', 'velocity', 'effort', 'force', 'torque'].map(t => (
                                                 <button key={t} onClick={() => setSelectedJointDataType(t as any)} className={`px-3 py-0.5 text-[10px] font-bold uppercase rounded-md transition-all ${selectedJointDataType === t ? 'bg-cyan-900/50 text-cyan-400 shadow-sm' : 'text-gray-600 hover:text-gray-400'}`}>{t}</button>
                                             ))}
                                         </div>

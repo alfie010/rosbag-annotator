@@ -31,6 +31,23 @@ export interface JointStateMsg {
     effort: number[];
 }
 
+export interface WrenchStampedMsg {
+    header?: any;
+    wrench: {
+        force: { x: number; y: number; z: number };
+        torque: { x: number; y: number; z: number };
+    };
+}
+
+export interface ChartSeriesMsg {
+    name: string[];
+    position?: number[];
+    velocity?: number[];
+    effort?: number[];
+    force?: number[];
+    torque?: number[];
+}
+
 export type ParsedFrame = {
     timestamp: number;
     index: number;
@@ -74,11 +91,13 @@ export class BagService {
     public timestamps: number[] = []; 
     public topicMetadata: Record<string, { msgType: string; title: string }> = {};
     public historicalJointData: Map<number, Record<string, JointStateMsg>> = new Map();
+    public historicalPlotData: Map<number, Record<string, ChartSeriesMsg>> = new Map();
     public historicalTaskState: Map<number, string> = new Map();
 
     // --- Private State ---
     private imageTopics: string[] = [];
     private jointTopics: string[] = [];
+    private wrenchTopics: string[] = [];
     private stringTopics: string[] = [];
     private overlayTopics: string[] = [];
     private frameImageIndex = new Map<number, FrameImageMap>(); // FrameIndex -> { Topic -> ExactTimestamp }
@@ -107,6 +126,10 @@ export class BagService {
                     this.topicMetadata[conn.topic] = { msgType: conn.type ?? 'unknown', title: conn.topic ?? '' };
                     this.jointTopics.push(conn.topic);
                 }
+                if (conn.type === 'geometry_msgs/WrenchStamped' || conn.type === 'geometry_msgs/msg/WrenchStamped') {
+                    this.topicMetadata[conn.topic] = { msgType: conn.type ?? 'unknown', title: conn.topic ?? '' };
+                    this.wrenchTopics.push(conn.topic);
+                }
                 if (conn.type === 'std_msgs/String') {
                     this.topicMetadata[conn.topic] = { msgType: conn.type ?? 'unknown', title: conn.topic ?? '' };
                     this.stringTopics.push(conn.topic);
@@ -123,9 +146,10 @@ export class BagService {
             // Sort topics for consistent processing
             this.imageTopics.sort();
             this.jointTopics.sort();
+            this.wrenchTopics.sort();
             this.overlayTopics.sort();
 
-            const targetTopics = [...this.imageTopics, ...this.jointTopics, ...this.stringTopics, ...this.overlayTopics];
+            const targetTopics = [...this.imageTopics, ...this.jointTopics, ...this.wrenchTopics, ...this.stringTopics, ...this.overlayTopics];
             if (targetTopics.length === 0) throw new Error("No compatible topics found.");
 
             // 2. Extract All Messages
@@ -143,7 +167,7 @@ export class BagService {
                 };
 
                 // For JointState, we need the full data
-                if (this.jointTopics.includes(msg.topic) || this.stringTopics.includes(msg.topic) || this.overlayTopics.includes(msg.topic)) {
+                if (this.jointTopics.includes(msg.topic) || this.wrenchTopics.includes(msg.topic) || this.stringTopics.includes(msg.topic) || this.overlayTopics.includes(msg.topic)) {
                     lightMsg.data = msg.message;
                 }
                 // Otherwise, for Image, we only need the timestamp
@@ -162,7 +186,8 @@ export class BagService {
             let startMsgIndex = 0;
             let firstFullStateTime: number | null = null;
             
-            const currentJoints: Record<string, any> = {}; 
+            const currentJoints: Record<string, any> = {};
+            const currentWrenches: Record<string, any> = {};
             const currentImageTimes = new Map<string, Time>();
             const currentOverlays: Record<string, any> = {};
 
@@ -175,6 +200,8 @@ export class BagService {
                 // Update current state
                 if (this.jointTopics.includes(msg.topic)) {
                     currentJoints[msg.topic] = msg.data;
+                } else if (this.wrenchTopics.includes(msg.topic)) {
+                    currentWrenches[msg.topic] = msg.data;
                 } else if (this.stringTopics.includes(msg.topic)) {
                     // Update task state if topic matches
                     if (msg.topic === '/puppet/task_state') {
@@ -189,7 +216,7 @@ export class BagService {
                 // Check if all topics have been seen
                 // Note: We don't strictly require task_state to be present to start the timeline
                 // so we only check image/joint readiness for 'allReady'
-                const vitalTopics = [...this.imageTopics, ...this.jointTopics];
+                const vitalTopics = [...this.imageTopics, ...this.jointTopics, ...this.wrenchTopics];
                 const allReady = vitalTopics.every(t => seenTopics.has(t));
                 if (allReady) {
                     firstFullStateTime = msg.timestamp;
@@ -222,6 +249,8 @@ export class BagService {
                     // Update current state
                     if (this.jointTopics.includes(msg.topic)) {
                         currentJoints[msg.topic] = msg.data;
+                    } else if (this.wrenchTopics.includes(msg.topic)) {
+                        currentWrenches[msg.topic] = msg.data;
                     } else if (this.stringTopics.includes(msg.topic)) {
                         // Update current state
                         if (msg.topic === '/puppet/task_state') {
@@ -237,6 +266,7 @@ export class BagService {
                 }
                 // Snapshot data for this frame
                 this.snapshotJointData(frameIdx, currentJoints);
+                this.snapshotPlotData(frameIdx, currentJoints, currentWrenches);
                 this.snapshotOverlayData(frameIdx, currentOverlays);
                 this.frameImageIndex.set(frameIdx, new Map(currentImageTimes));
                 this.historicalTaskState.set(frameIdx, currentTaskState);
@@ -275,6 +305,47 @@ export class BagService {
         this.historicalJointData.set(frameIdx, frameJoints);
     }
 
+    private snapshotPlotData(frameIdx: number, currentJoints: Record<string, any>, currentWrenches: Record<string, any>) {
+        const frameSeries: Record<string, ChartSeriesMsg> = {};
+
+        this.jointTopics.forEach(topic => {
+            const rawMsg = currentJoints[topic];
+            if (!rawMsg) return;
+
+            if (!rawMsg.name || rawMsg.name.length === 0) {
+                const len = rawMsg.position ? rawMsg.position.length : 0;
+                const generatedNames = Array.from({ length: len }, (_, k) => `joint${k + 1}`);
+                frameSeries[topic] = {
+                    ...rawMsg,
+                    name: generatedNames
+                };
+            } else {
+                frameSeries[topic] = rawMsg;
+            }
+        });
+
+        this.wrenchTopics.forEach(topic => {
+            const rawMsg = currentWrenches[topic] as WrenchStampedMsg | undefined;
+            if (!rawMsg?.wrench) return;
+
+            frameSeries[topic] = {
+                name: ['force.x', 'force.y', 'force.z', 'torque.x', 'torque.y', 'torque.z'],
+                force: [
+                    rawMsg.wrench.force?.x ?? 0,
+                    rawMsg.wrench.force?.y ?? 0,
+                    rawMsg.wrench.force?.z ?? 0
+                ],
+                torque: [
+                    rawMsg.wrench.torque?.x ?? 0,
+                    rawMsg.wrench.torque?.y ?? 0,
+                    rawMsg.wrench.torque?.z ?? 0
+                ]
+            };
+        });
+
+        this.historicalPlotData.set(frameIdx, frameSeries);
+    }
+
     private snapshotOverlayData(frameIdx: number, currentOverlays: Record<string, any>) {
         this.frameOverlayIndex.set(frameIdx, { ...currentOverlays });
     }
@@ -284,11 +355,13 @@ export class BagService {
         this.timestamps = [];
         this.topicMetadata = {};
         this.historicalJointData.clear();
+        this.historicalPlotData.clear();
         this.historicalTaskState.clear();
         this.frameImageIndex.clear();
         this.frameOverlayIndex.clear();
         this.imageTopics = [];
         this.jointTopics = [];
+        this.wrenchTopics = [];
         this.stringTopics = [];
         this.overlayTopics = [];
         this.bag = null;
